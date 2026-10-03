@@ -76,7 +76,7 @@ Before an `Edit`, `Write` or `NotebookEdit` of a file inside the project, the pl
 - Records without a scope never trigger the guard.
 
 When an edit matches, Claude Code asks once, in its own question dialog. The question lists every matching record's title and why.
-- **Allow** is remembered for those records for the rest of the session.
+- **Allow** is remembered for those records for the rest of the conversation, including its other processes and a later `--resume`.
 - **Stop** refuses that edit and tells Claude why. The next matching edit asks again, so nothing is ever blocked without you seeing it.
 - If the question can't be shown (it was dismissed, or the run is headless with `-p`), the edit goes ahead and the plugin logs a line.
 - Edits running in parallel, for example from two subagents, each get their own question.
@@ -98,9 +98,11 @@ Fallbacks:
 - If Hark answers `end_session` with an error, the plugin calls `session_stopped` instead, and Hark drafts the handoff from repo activity.
 - If Hark doesn't answer in time, the plugin doesn't retry. Hark's own 45-minute idle sweep drafts the handoff, and it also covers a crash.
 
-Two cases skip the handoff:
+Four cases skip the handoff:
 - A session with no edits, commits or test runs (only questions and answers, say) closes its Hark session with `close_session` and writes no handoff.
 - If Claude itself already wrote a Hark handoff (an `end_session` tool call that succeeded), that work isn't recorded twice.
+- If another Claude Code process of the same conversation already handed the work off, this one sends nothing for it.
+- If the conversation moved to a background process, the process it left sends nothing; the background process hands off instead. See [One conversation, several processes](#one-conversation-several-processes).
 
 Claude Code gives all exit hooks together about 1.5 seconds. The plugin sends one request in that window and leaves 0.4 seconds for the hooks after it.
 
@@ -110,8 +112,8 @@ All network traffic is HTTPS `POST https://harkstudio.io/mcp`: one stateless MCP
 
 | Tool | When | Arguments sent |
 | --- | --- | --- |
-| *every request below* | Always | Headers `Content-Type: application/json`, `Accept: application/json, text/event-stream`, `Authorization: Bearer <your access key>`, `User-Agent: hark-mod/<version> (claude-code/<version>)` (the plugin's version from `plugin.json` and the Claude Code version, for example `hark-mod/0.1.0 (claude-code/2.1.288)`), `X-Hark-Client: claude-code-mod`; and in the JSON-RPC body, `params._meta.client: "claude-code-mod"` beside the tool's `name` and `arguments` |
-| `get_agent_brief` | Session start; after each compaction; `/hark brief`; the first message after `/clear` or a resume | `venture` (project code), `depth: "compact"` |
+| *every request below* | Always | Headers `Content-Type: application/json`, `Accept: application/json, text/event-stream`, `Authorization: Bearer <your access key>`, `User-Agent: hark-mod/<version> (claude-code/<version>)` (the plugin's version from `plugin.json` and the Claude Code version, for example `hark-mod/0.2.0 (claude-code/2.1.288)`), `X-Hark-Client: claude-code-mod`; and in the JSON-RPC body, beside the tool's `name` and `arguments`, `params._meta.client: "claude-code-mod"` and `params._meta.conversation: "<conversation id>"` (32 random hex characters, the same in every process of one conversation; it reveals nothing about your machine; see [One conversation, several processes](#one-conversation-several-processes)) |
+| `get_agent_brief` | Session start, unless another process of this conversation saved its state in the last 30 minutes (the agent view's empty placeholder waits for its first message); after each compaction; `/hark brief`; the first message after `/clear` or a resume | `venture` (project code), `depth: "compact"` |
 | `list_journal_entries` | The first guarded edit of a session, and the first after each compaction; a minute after a failed attempt | `venture`, `kind: "decision"`, `limit: 200` |
 | `list_candidates` | `/hark needs` | `venture` |
 | `get_venture` | `/hark open`, until the project's id is known, when the project file holds a code (`V-012`) rather than an id | `id_or_code` |
@@ -125,8 +127,33 @@ The plugin also runs these local commands. None of them makes a network request 
 | --- | --- |
 | `security find-generic-password -s hark -w` (macOS), `secret-tool lookup service hark` (Linux) | Session start, only when neither `HARK_TOKEN` nor `HARK_PAT` is set |
 | `open <project URL>`, then `xdg-open <project URL>` | `/hark open` |
+| `mkdir -p -m 700 <state folder>`, then `chmod 700 <state folder>` | Start-up, so the state folder is readable by you alone |
+| `mkdir <state folder>/<key>.<segment>.lock` | Just before a handoff, so only one process sends it |
+| `tail -c 65536 <transcript>` (falling back to reading the file) | At session end, to see whether the conversation moved to a background process |
 
 **Never sent:** file contents, diffs, edit text, your prompts, the transcript (only the cleaned agent notes described above), tool output (only a commit's subject line, cleaned the same way), environment variables, or the access key except in the `Authorization` header. Files outside the project are neither guarded nor reported. The edit guard's matching happens on your machine.
+
+## One conversation, several processes
+
+Claude Code can move a conversation into a background process: Left arrow on an empty prompt, or `/background`. `claude --resume` also starts a new process on an old conversation. Each process loads its own copy of hark, and the copies share a small state file, so they act as one.
+
+- **Finding the conversation.** Every process of one conversation computes the same local key: a SHA-256 of the project root and the conversation's first launch time (`startedAt` in Claude Code's plugin API). A background move and `--resume` keep that time, and `/clear` starts a new one. The key only names the state file; it never leaves your machine.
+- **The conversation id sent to Hark** is 32 random hex characters, created by the first process and kept in the state file. It goes out on every request as `params._meta.conversation`, so Hark can reuse the conversation's open session instead of opening another.
+- **The state folder** is `$CLAUDE_CONFIG_DIR/hark` (by default `~/.claude/hark`). Where Claude Code can run commands, it is created readable by you alone. It holds one `<key>.json` per conversation, plus a `<key>.<segment>.lock` folder per handoff, kept until you delete them. Each file holds:
+  - the files, commits, test runs and pull request links seen since the last handoff, and Claude's latest notes, cleaned as described above;
+  - the decisions you allowed in the edit guard;
+  - the last brief and when it was fetched;
+  - whether a Hark session is open and whether this work was already handed off;
+  - the Claude Code session ids that carried the conversation.
+- **A second process resumes the conversation.** While the state is under 30 minutes old it reuses the saved brief, injecting it without calling Hark, and it keeps your Allow answers and the work recorded so far.
+- **At most one handoff per piece of work.** Before handing off, a process takes a lock with `mkdir`, which only one process can win, and marks the work closed before it sends anything. Another process ending later sends nothing for that work. Work done after a handoff, including after `/hark handoff`, starts a new segment and gets its own handoff. A lock older than 30 seconds was left by a process that died mid-handoff, and is ignored.
+- **The original process stays quiet after a move.** If its transcript ends with the move to the background, it leaves the handoff to the process that now carries the conversation (`claude stop <id>`, or quitting it, ends that one). When the transcript can't be read, the state file's record of the latest process to join decides.
+- **The agent view's empty "new session" placeholder** makes no Hark call, and writes no state, until someone gives it a task.
+
+Limits:
+- The lock needs a `mkdir` command; stock Windows has none, so there the closed flag alone guards against a second handoff.
+- A deliberate fork in the same folder (`claude --resume <id> --fork-session`) keeps the original's launch time, so it shares the original's state, Allow answers and handoff.
+- Without `HOME`, `USERPROFILE` or `CLAUDE_CONFIG_DIR`, or when the state folder can't be written, nothing is shared. Each process then hands off its own work, as in 0.1.0.
 
 ## Uninstall
 
@@ -144,7 +171,7 @@ claude plugin uninstall hark@hark
 claude plugin marketplace remove hark
 ```
 
-If you installed it from the directory, use `hark@claude-plugins-official` instead. To remove the access key too, run `security delete-generic-password -s hark` on macOS or `secret-tool clear service hark` on Linux. You can also unset `HARK_TOKEN` or `HARK_PAT`. The plugin keeps no files of its own.
+If you installed it from the directory, use `hark@claude-plugins-official` instead. To remove the access key too, run `security delete-generic-password -s hark` on macOS or `secret-tool clear service hark` on Linux. You can also unset `HARK_TOKEN` or `HARK_PAT`. Delete `$CLAUDE_CONFIG_DIR/hark/` (by default `~/.claude/hark/`) to remove the plugin's conversation state.
 
 ## Development
 
@@ -163,6 +190,20 @@ The tests in [tests/](tests/) run against Claude Code's own hook engine with an 
 - the handoff, its fallbacks and `/hark`;
 - an unreachable, refusing or hung server;
 - the privacy rules: no edit text, code or credentials leave the machine.
+
+## Changelog
+
+### 0.2.0 (2026-10-03)
+
+- Background sessions and `--resume`: hark finds each conversation by a stable local key and shares its state between processes through `~/.claude/hark/<key>.json`. A conversation moved to a background process keeps its brief, its edits and your Allow answers, and its work is handed off at most once.
+- Every request carries `params._meta.conversation`, a random id per conversation, so Hark can reuse the conversation's open session.
+- Repeated test runs are each counted in the handoff.
+- The agent view's empty placeholder session no longer fetches a brief.
+- Every request names the mod: `User-Agent: hark-mod/<version> (claude-code/<version>)`, `X-Hark-Client: claude-code-mod`, and `params._meta.client`.
+
+### 0.1.0 (2026-10-03)
+
+- First release: the brief on the first message, the recap after compaction, the edit guard, the handoff, the status line and `/hark`.
 
 ## License
 

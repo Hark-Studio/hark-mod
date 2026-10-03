@@ -5,6 +5,15 @@ export const ENDPOINT = 'https://harkstudio.io/mcp'
 export const ROOT = '/work'
 export const UUID = 'b409db7e-ea4c-4229-8a55-03eab8865d8f'
 export const RUNTIME = '2.1.288'
+export const STARTED = 1791061331000 // the conversation's first launch, as $.session.usage().startedAt reports it
+export const HOME = '/home/me'
+
+/** The conversation key hark derives: the first 16 bytes of SHA-256(root + '#' + startedAt), in hex. */
+export async function keyOf(root = ROOT, started = STARTED): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${root}#${started}`))
+  return [...new Uint8Array(digest).slice(0, 16)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+export const stateFile = (key: string) => `${HOME}/.claude/hark/${key}.json`
 // The plugin's own manifest as the host returns it (the test environment has no file system).
 export const MANIFEST = { name: 'hark', version: '0.1.0' }
 
@@ -54,6 +63,8 @@ export function world(
     cwd?: string
     project?: string | null
     files?: Record<string, string>
+    sessionId?: string
+    started?: () => number
     hark?: (tool: string, args: Record<string, unknown>, call: Call) => Reply | undefined | Promise<Reply | undefined>
     keychain?: string
     answer?: (question: string) => string | null
@@ -61,22 +72,33 @@ export function world(
   } = {},
 ) {
   const w = {
-    calls: [] as Call[], reads: [] as string[], runs: [] as string[][], statuses: [] as (string | undefined)[], logs: [] as string[],
+    calls: [] as Call[], reads: [] as string[], writes: [] as string[], runs: [] as string[][], dirs: new Set<string>(), lockTimes: new Map<string, number>(), statuses: [] as (string | undefined)[], logs: [] as string[],
     asks: [] as { question: string; header?: string; options: string[] }[], invalidated: [] as string[], commands: [] as string[],
   }
   const tools = () => w.calls.map(c => c.tool)
   const sent = () => w.calls.map(c => c.body).join('\n')
 
   on('session.root', () => ({ value: opts.cwd ?? ROOT }))
-  const files = opts.files ?? (opts.project === null ? {} : { [`${ROOT}/.hark/project`]: opts.project ?? 'V-012\n' })
+  const files: Record<string, string> = opts.files ?? (opts.project === null ? {} : { [`${ROOT}/.hark/project`]: opts.project ?? 'V-012\n' })
   on('fs.read', ($, e) => {
     w.reads.push(e.path)
     if (e.path.endsWith('/.claude-plugin/plugin.json')) return { value: JSON.stringify(MANIFEST) }
     return e.path in files ? { value: files[e.path] as string } : { deny: `ENOENT: ${e.path}` }
   })
   on('session.version', () => ({ value: { version: RUNTIME, base: RUNTIME } }))
+  on('session.usage', () => ({ value: { startedAt: opts.started?.() ?? STARTED } as never }))
+  on('session.id', () => ({ value: opts.sessionId ?? 'sess-1' }))
+  on('fs.write', ($, e) => ((files[e.path] = e.text), w.writes.push(e.path), { value: undefined }))
+  on('fs.exists', ($, e) => ({ value: e.path in files || w.dirs.has(e.path) }))
+  on('fs.stat', ($, e) =>
+    w.dirs.has(e.path) ? { value: { kind: 'dir' as const, size: 0, mtimeMs: w.lockTimes.get(e.path) ?? 0, isLink: false } } : { deny: `ENOENT: ${e.path}` })
   on('process.run', ($, e) => {
     w.runs.push([...e.argv])
+    const done = (exitCode: number, stdout = '') => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    const target = e.argv.at(-1) ?? ''
+    if (e.argv[0] === 'mkdir' && e.argv.includes('-p')) return w.dirs.add(target), done(0)
+    if (e.argv[0] === 'mkdir') return w.dirs.has(target) ? done(1) : (w.dirs.add(target), done(0))
+    if (e.argv[0] === 'tail') return target in files ? done(0, (files[target] ?? '').slice(-Number(e.argv[2]))) : done(1)
     const found = e.argv[0] === 'security' && opts.keychain !== undefined
     const exitCode = e.argv[0] === 'security' || e.argv[0] === 'secret-tool' ? (found ? 0 : 44) : 0
     return { value: { exitCode, stdout: found ? `${opts.keychain}\n` : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -101,8 +123,10 @@ export function world(
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('prompt.context', ($, e) => ({ blocks: e.blocks }))
+  on('prompt.submit', ($, e) => ({ text: e.text }))
   on('session.compact', ($, e) => ({ messages: e.messages }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('classic.SessionEnd', () => ({}))
   on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
     const q = e.questions[0]
     w.asks.push({ question: q?.question ?? '', header: q?.header, options: (q?.options ?? []).map(x => x.label) })
@@ -115,7 +139,7 @@ export function world(
   })
   on('tool.call', ($, e) => ({ result: { ok: true }, text: `ran ${e.tool}` }) as never)
 
-  return { ...w, tools, sent }
+  return { ...w, files, tools, sent }
 }
 
 /** Answers every Hark tool the way a healthy server would, with end_session's real argument rules. */
