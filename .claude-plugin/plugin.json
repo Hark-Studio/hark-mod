@@ -1,9 +1,13 @@
 {
-  "name": "hark",
+  "name": "hark-memory",
   "displayName": "Hark — shared project memory",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Brings your Hark project brief into every session, keeps the plan through compaction, checks edits against accepted decisions, and writes the handoff when you stop.",
-  "author": { "name": "Hark Studio", "email": "hello@harkstudio.io", "url": "https://harkstudio.io" },
+  "author": {
+    "name": "Hark Studio",
+    "email": "hello@harkstudio.io",
+    "url": "https://harkstudio.io"
+  },
   "homepage": "https://harkstudio.io",
   "repository": "https://github.com/Hark-Studio/hark-mod",
   "documentationUrl": "https://harkstudio.io/how-it-works/connect/claude-code-mod",
@@ -11,5 +15,19 @@
   "privacyPolicyUrl": "https://harkstudio.io/privacy",
   "icon": "./assets/icon.png",
   "license": "MIT",
-  "keywords": ["hark", "handoff", "decisions", "project-memory", "mcp"]
+  "keywords": [
+    "hark",
+    "handoff",
+    "decisions",
+    "project-memory",
+    "mcp"
+  ],
+  "userConfig": {
+    "access_key": {
+      "type": "string",
+      "title": "Hark access key",
+      "description": "Your Hark personal access token (from harkstudio.io/connections). Claude Code keeps it in its secure storage; hark never stores it.",
+      "sensitive": true
+    }
+  }
 }

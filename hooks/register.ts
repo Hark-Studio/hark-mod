@@ -4,8 +4,8 @@
 // and lets the session carry on.
 import type { EngineInterface, Register } from 'claude-code'
 
-const APP = 'https://harkstudio.io'
 const CLIENT = 'claude-code-mod' // X-Hark-Client header and params._meta.client on every request
+const CONFIGURE = '/plugin configure hark-memory@hark (hark-memory@claude-plugins-official for a directory install)'
 const CODE = /\b(V-\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i
 const TESTS = /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test|(?:go|cargo|deno|mix|dotnet|swift|make)\s+test|python3?\s+-m\s+(?:pytest|unittest)|pytest|vitest|jest|mocha|rspec|phpunit|tox|claude\s+plugin\s+test)\b/
 const NEXT = /^\W*(?:#+\s*)?(?:\*\*)?next (?:steps?|up)\b[^\w\n]*/i
@@ -28,12 +28,12 @@ type Conversation = {
   files: string[]; commits: string[]; tests: string[]; links: string[]; allowed: string[]; sessions: string[]
 }
 type Hark = { ready: Promise<boolean> | null; root: string; code: string; token: string; agent: string; rpc: number; uuid: string
-  file: string; shared: boolean; session: string; moved: boolean; prompted: boolean
+  home: string; key: string; shared: boolean; session: string; moved: boolean; prompted: boolean
   brief: Promise<unknown> | null; rules: Promise<Rule[]> | null; retry: number; c: Conversation; logged: Set<string> }
 const LISTS = ['files', 'commits', 'tests', 'links', 'allowed', 'sessions'] as const
 const conversation = (): Conversation => ({ id: '', latest: '', segment: 0, closed: false, opened: false, updatedAt: 0, brief: null,
   briefAt: 0, recap: false, handoff: 'Open', needs: 0, notes: '', files: [], commits: [], tests: [], links: [], allowed: [], sessions: [] })
-const fresh = (): Hark => ({ ready: null, root: '', code: '', token: '', agent: '', rpc: 0, uuid: '', file: '', shared: false, session: '',
+const fresh = (): Hark => ({ ready: null, root: '', code: '', token: '', agent: '', rpc: 0, uuid: '', home: '', key: '', shared: false, session: '',
   moved: false, prompted: false, brief: null, rules: null, retry: 0, c: conversation(), logged: new Set() })
 const hex = (bytes: Uint8Array) => [...bytes].map(b => b.toString(16).padStart(2, '0')).join('')
 const add = (list: string[], value: string) => { if (!list.includes(value)) list.push(value) }
@@ -50,11 +50,14 @@ const frame = (tag: string, code: string, body: string) => `<${tag} project="${c
 const clean = (t: string, token: string) =>
   (token ? t.split(token).join('[redacted]') : t).replace(FENCE, '[code omitted]').replace(SECRET, '[redacted]').trim().slice(0, 1500)
 
-export const register: Register = on => {
+// Module scope holds constants only: setting a new access key reloads the plugin, and register runs again with it.
+export const register: Register = (on, options) => {
+  // The access key is the plugin's sensitive userConfig option: Claude Code keeps it in its secure storage, never hark.
+  const accessKey = typeof options.access_key === 'string' ? options.access_key.trim() : ''
   let s = fresh()
 
   on('session.start', async ($, e, next) => {
-    if (!(await placeholder($))) s.ready ??= boot($, s)
+    if (!(await placeholder($))) s.ready ??= boot($, s, accessKey)
     const spec = { name: 'hark', description: 'Hark project memory: brief | handoff | needs | open', argumentHint: 'brief|handoff|needs|open' }
     await $.command.register(spec).catch(() => undefined)
     return next(e)
@@ -65,7 +68,7 @@ export const register: Register = on => {
   on('prompt.context', async ($, e, next) => {
     const r = await next(e)
     if (!s.prompted && (await placeholder($))) return r
-    const b = (await (s.ready ??= boot($, s))) ? await (s.brief ??= brief($, s)) : null
+    const b = (await (s.ready ??= boot($, s, accessKey))) ? await (s.brief ??= brief($, s)) : null
     if (b == null) return r
     const text = s.c.recap
       ? frame('hark-recap', s.code, `Plan carried over from Hark after compaction:\n${render(b, true)}`)
@@ -157,12 +160,12 @@ export const register: Register = on => {
 
   // 5. /hark brief | handoff | needs | open
   on('command.run', { command: 'hark' }, async ($, e) => {
-    s.ready ??= boot($, s)
+    s.ready ??= boot($, s, accessKey)
     return { text: await command($, s, e.args.trim().split(/\s+/)[0] || 'brief') }
   })
 }
 
-async function boot($: EngineInterface, s: Hark): Promise<boolean> {
+async function boot($: EngineInterface, s: Hark, accessKey: string): Promise<boolean> {
   try {
     // .hark/project (or a .hark file) in the session's directory or the nearest one above it
     for (let dir = await $.session.root(); !s.code && dir; dir = dir.replace(/[\\/][^\\/]*$/, '')) {
@@ -170,23 +173,23 @@ async function boot($: EngineInterface, s: Hark): Promise<boolean> {
       s.root = dir
     }
     if (!s.code) return false
-    s.token = (await $.env.get('HARK_TOKEN'))?.trim() || (await $.env.get('HARK_PAT'))?.trim()
-      || (await run($, ['security', 'find-generic-password', '-s', 'hark', '-w']))
-      || (await run($, ['secret-tool', 'lookup', 'service', 'hark'])) || ''
-    if (!s.token) return note($, s, 'no access key; set HARK_TOKEN or HARK_PAT (or, on macOS and Linux, a "hark" keychain item)'), false
+    s.token = accessKey
+    if (!s.token) return note($, s, `no access key; set it with ${CONFIGURE}`), false
     // Requests name the mod and the engine: User-Agent hark-mod/<plugin.json version> (claude-code/<runtime version>)
     const manifest = o(parse(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`).catch(() => ''), null))
     const runtime = await $.session.version().then(v => v.version, () => 'unknown')
     s.agent = `hark-mod/${manifest.version ?? 'unknown'} (claude-code/${runtime})`
-    // The state file's name is the same in every process that carries this conversation: a hash of the session root and the
-    // conversation's first launch, which a background move and --resume keep and /clear starts over.
+    // The state file, ~/.claude/hark/<key>.json, has the same name in every process that carries this conversation: a hash
+    // of the session root and the conversation's first launch, which a background move and --resume keep and /clear starts over.
     s.session = await $.session.id().catch(() => '')
     const started = await $.session.usage().then(u => `${s.root}#${u.startedAt}`, () => s.session)
-    const key = hex(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(started))).slice(0, 16))
-    const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE'))
-    const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || (home ? `${home}/.claude` : '')
-    if (config) await run($, ['mkdir', '-p', '-m', '700', `${config}/hark`]).then(() => run($, ['chmod', '700', `${config}/hark`]))
-    s.file = config ? `${config}/hark/${key}.json` : ''
+    s.key = hex(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(started))).slice(0, 16))
+    s.home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE')) || ''
+    if (s.home) {
+      // the folder is readable by this user alone, where the host can set that
+      await $.process.run(['mkdir', '-p', '-m', '700', `${s.home}/.claude/hark`], { timeoutMs: 1000 }).catch(() => null)
+      await $.process.run(['chmod', '700', `${s.home}/.claude/hark`], { timeoutMs: 1000 }).catch(() => null)
+    }
     await save($, s) // what other processes of this conversation left
     const recent = s.c.brief != null && (await $.clock.now()) - s.c.updatedAt < STATE_FRESH_MS
     await save($, s, c => {
@@ -202,21 +205,25 @@ async function boot($: EngineInterface, s: Hark): Promise<boolean> {
 
 // MCP over HTTP, stateless: each call is one JSON-RPC tools/call POST, as Hark's own hooks send it.
 async function call($: EngineInterface, s: Hark, tool: string, args: Record<string, unknown>, ms = 3000): Promise<unknown> {
-  const _meta = { client: CLIENT, conversation: s.c.id }
-  const req = { jsonrpc: '2.0', id: ++s.rpc, method: 'tools/call', params: { name: tool, arguments: args, _meta } }
-  const headers = {
-    'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${s.token}`,
-    'user-agent': s.agent, 'x-hark-client': CLIENT,
-  }
-  const wait = Math.max(100, ms)
+  const id = ++s.rpc, wait = Math.max(100, ms)
   const late = $.clock.sleep(wait).then(() => Promise.reject(new Error(`no reply in ${wait}ms`)), () => new Promise<never>(() => {}))
-  const res = await Promise.race([$.http.fetch(`${APP}/mcp`, { method: 'POST', headers, body: JSON.stringify(req) }), late])
+  const res = await Promise.race([
+    $.http.fetch('https://harkstudio.io/mcp', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${s.token}`,
+        'user-agent': s.agent, 'x-hark-client': CLIENT,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: tool, arguments: args, _meta: { client: CLIENT, conversation: s.c.id } } }),
+    }),
+    late,
+  ])
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
   // The reply is one JSON-RPC message, or an SSE stream whose data lines carry it.
   const frames = res.headers['content-type']?.includes('event-stream')
     ? res.text.split(/\r?\n\r?\n/).map(f => f.split(/\r?\n/).filter(l => l.startsWith('data:')).map(l => l.slice(5).trim()).join('\n'))
     : [res.text]
-  const msg = frames.map(f => o(parse(f, null))).find(m => m.id === req.id) ?? {}
+  const msg = frames.map(f => o(parse(f, null))).find(m => m.id === id) ?? {}
   if (msg.error) throw new Error(String(o(msg.error).message ?? 'JSON-RPC error'))
   if (!msg.result) throw new Error('unreadable reply')
   const r = o(msg.result)
@@ -359,11 +366,10 @@ async function handoff($: EngineInterface, s: Hark, left: () => number): Promise
 
 // mkdir is atomic: when two processes end the same conversation at once, only one gets to hand off its segment.
 async function claim($: EngineInterface, s: Hark): Promise<boolean> {
-  if (!s.file) return true
-  const lock = s.file.replace(/\.json$/, `.${s.c.segment}.lock`)
-  const made = await $.process.run(['mkdir', lock], { timeoutMs: 250 }).catch(() => null)
+  if (!s.home) return true
+  const made = await $.process.run(['mkdir', `${s.home}/.claude/hark/${s.key}.${s.c.segment}.lock`], { timeoutMs: 250 }).catch(() => null)
   if (made === null || made.exitCode === 0) return true // no process API here (or the lock is ours): the closed flag decides
-  const held = await $.fs.stat(lock).then(st => st.mtimeMs, () => 0)
+  const held = await $.fs.stat(`${s.home}/.claude/hark/${s.key}.${s.c.segment}.lock`).then(st => st.mtimeMs, () => 0)
   return (await $.clock.now()) - held > LOCK_STALE_MS
 }
 
@@ -371,7 +377,8 @@ async function claim($: EngineInterface, s: Hark): Promise<boolean> {
 // null when the transcript can't be read (no tail command, too big to read whole).
 async function movedAway($: EngineInterface, transcript: string): Promise<boolean | null> {
   if (!transcript) return null
-  const tail = (await run($, ['tail', '-c', '65536', transcript])) ?? (await $.fs.read(transcript).catch(() => null))?.slice(-65536)
+  const tailed = await $.process.run(['tail', '-c', '65536', transcript], { timeoutMs: 1000 }).then(r => (r.exitCode === 0 ? r.stdout : null), () => null)
+  const tail = tailed ?? (await $.fs.read(transcript).catch(() => null))?.slice(-65536)
   if (tail == null) return null
   const types = tail.split('\n').map(line => String(o(parse(line, null)).type ?? ''))
   const at = types.lastIndexOf('continued-in')
@@ -380,13 +387,13 @@ async function movedAway($: EngineInterface, transcript: string): Promise<boolea
 
 // Read-merge-write of the conversation's state file, so the processes sharing a conversation see each other's work.
 async function save($: EngineInterface, s: Hark, change?: (c: Conversation) => void): Promise<void> {
-  if (s.file) s.c = merge(s.c, sane(parse(await $.fs.read(s.file).catch(() => ''), null)))
+  if (s.home) s.c = merge(s.c, sane(parse(await $.fs.read(`${s.home}/.claude/hark/${s.key}.json`).catch(() => ''), null)))
   if (!change) return
   change(s.c)
   s.c.updatedAt = await $.clock.now()
-  if (!s.file) return
+  if (!s.home) return
   try {
-    await $.fs.write(s.file, JSON.stringify(s.c))
+    await $.fs.write(`${s.home}/.claude/hark/${s.key}.json`, JSON.stringify(s.c)) // the only file hark writes
     s.shared = true
   } catch (err) {
     s.shared = false
@@ -442,7 +449,7 @@ function handoffArgs(s: Hark, act: Conversation) {
 }
 
 async function command($: EngineInterface, s: Hark, sub: string): Promise<string> {
-  if (!(await s.ready)) return 'Hark is not set up here: run `hark init`, then set HARK_TOKEN (or HARK_PAT) or add a "hark" keychain item.'
+  if (!(await s.ready)) return `Hark is not set up here: run \`hark init\` in the project, then set the access key with ${CONFIGURE}.`
   if (sub === 'handoff') return handoff($, s, () => 3400)
   if (sub === 'brief') {
     const b = (await brief($, s)) ?? (await s.brief)
@@ -455,7 +462,7 @@ async function command($: EngineInterface, s: Hark, sub: string): Promise<string
     const items = [...proposals, ...a(o(r).build_state_fields).map(v => `- proposed ${o(v).field ?? words(v)}`)]
     await save($, s, c => { c.needs = items.length })
     show($, s)
-    return items.length ? `**${items.length} need you** (review at ${APP})\n${items.join('\n')}` : 'Nothing needs you.'
+    return items.length ? `**${items.length} need you** (review at https://harkstudio.io)\n${items.join('\n')}` : 'Nothing needs you.'
   }
   if (sub !== 'open') return 'Usage: /hark brief | handoff | needs | open'
   const isId = (v: unknown): v is string => typeof v === 'string' && /^[0-9a-f-]{36}$/i.test(v)
@@ -464,19 +471,16 @@ async function command($: EngineInterface, s: Hark, sub: string): Promise<string
     const v = await attempt($, s, 'project link unavailable', 'get_venture', { id_or_code: s.code })
     if (!(v instanceof Error)) s.uuid = [o(v).id, o(o(v).venture).id].find(isId) ?? ''
   }
-  const url = s.uuid ? `${APP}/ventures/${s.uuid}` : `${APP}/studio`
-  const opened = (await run($, ['open', url])) !== null || (await run($, ['xdg-open', url])) !== null
+  const url = s.uuid ? `https://harkstudio.io/ventures/${s.uuid}` : 'https://harkstudio.io/studio'
+  const opened = (await $.process.run(['open', url], { timeoutMs: 5000 }).then(r => r.exitCode === 0, () => false))
+    || (await $.process.run(['xdg-open', url], { timeoutMs: 5000 }).then(r => r.exitCode === 0, () => false))
   return `${opened ? 'Opened' : 'Open'} [${s.code} on Hark](${url})`
 }
 
+// The agent view's empty "new session" placeholder: a spare process nobody has given a prompt yet. Counting the
+// prompts keeps a placeholder that got a task, then reloaded (a changed access key), from going quiet.
 async function placeholder($: EngineInterface): Promise<boolean> {
-  return (await $.env.get('CLAUDE_BG_SOURCE')) === 'spare'
-}
-
-// A host command's trimmed stdout, or null when it is missing, fails or times out.
-async function run($: EngineInterface, argv: string[]): Promise<string | null> {
-  const r = await $.process.run(argv, { timeoutMs: 5000 }).catch(() => null)
-  return r?.exitCode === 0 ? r.stdout.trim() : null
+  return (await $.env.get('CLAUDE_BG_SOURCE')) === 'spare' && (await $.session.turns().catch(() => 0)) === 0
 }
 
 function show($: EngineInterface, s: Hark) {

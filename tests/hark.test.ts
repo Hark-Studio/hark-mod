@@ -3,12 +3,15 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import { BRIEF, COMMAND, EDIT, END, ENDPOINT, HOME, MANIFEST, MESSAGES, RUNTIME, SESSION, STARTED, TURN, UUID, healthy, keyOf, rpc, stateFile, world } from './world'
 
 type Blocks = { blocks: readonly { name: string; text: string }[] }
+const COMMIT = '[main abc1234def] Add the guard\n 1 file changed'
+const bash = (cmd: string) => cmd.startsWith('git commit')
+  ? { result: { stdout: `[INFO] token=abc\n${COMMIT}`, stderr: '', interrupted: false, gitOperation: { commit: { sha: 'abc1234def', kind: 'committed' } } } }
+  : { result: { stdout: 'tests ok', stderr: '', interrupted: false }, isError: cmd.includes('pytest') }
 const block = async ($: { prompt: { context: (e: Blocks) => Promise<Blocks> } }) =>
   (await $.prompt.context({ blocks: [{ name: 'currentDate', text: '2026-10-03' }] })).blocks
 
 describe('brief', () => {
-  test('rides the first message as a delimited block, with the status line', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('rides the first message as a delimited block, with the status line', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy })
 
@@ -27,8 +30,7 @@ describe('brief', () => {
     expect(w.commands).toEqual(['hark'])
   })
 
-  test('names the mod on every request: User-Agent, X-Hark-Client and params._meta.client', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('names the mod on every request: User-Agent, X-Hark-Client and params._meta.client', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy, answer: () => 'Allow' })
 
@@ -45,6 +47,8 @@ describe('brief', () => {
     expect(conversation).toMatch(/^[0-9a-f]{32}$/)
     expect(conversation).not.toBe(await keyOf()) // random, not the guessable hash of the path and launch time
     for (const c of w.calls) {
+      expect(c.url, c.tool).toBe(ENDPOINT)
+      expect(c.headers.authorization, c.tool).toBe('Bearer tok')
       expect(c.headers['user-agent'], c.tool).toBe(`hark-mod/${MANIFEST.version} (claude-code/${RUNTIME})`)
       expect(c.headers['x-hark-client'], c.tool).toBe('claude-code-mod')
       expect(JSON.parse(c.body).params._meta, c.tool).toEqual({ client: 'claude-code-mod', conversation })
@@ -52,20 +56,36 @@ describe('brief', () => {
     expect(w.reads.filter(p => p.endsWith('/.claude-plugin/plugin.json'))).toHaveLength(1)
   })
 
-  test('falls back to the keychain when HARK_TOKEN is unset', async ($, on) => {
-    mock.env(on, {})
+  test("without an access key it stays idle: no request, command, file or question, one log line, and no HARK_* variable read", async ($, on) => {
     mock.clock(on)
-    const w = world(on, { hark: healthy, keychain: 'kc-token' })
+    const w = world(on, { env: { HOME, HARK_TOKEN: 'env-token', HARK_PAT: 'pat' }, hark: healthy, bash })
 
+    const first = await $.command.run(COMMAND('brief')) // /hark before session.start
     await $.session.start(SESSION)
     await block($)
+    await $.tool.call(EDIT('src/db/users.ts'))
+    await $.tool.call({ tool: 'Bash', command: 'git commit -m "x"' })
+    await $.turn.complete(TURN('Done.'))
+    await $.command.run(COMMAND('open'))
+    await $.session.end(END())
 
-    expect(w.runs[0]).toEqual(['security', 'find-generic-password', '-s', 'hark', '-w'])
-    expect(w.calls[0]?.headers.authorization).toBe('Bearer kc-token')
+    expect(first.text).toBe('Hark is not set up here: run `hark init` in the project, then set the access key with /plugin configure hark-memory@hark (hark-memory@claude-plugins-official for a directory install).')
+    expect([w.calls, w.runs, w.writes, w.asks, w.statuses]).toEqual([[], [], [], [], []])
+    expect(w.logs).toEqual(['hark: no access key; set it with /plugin configure hark-memory@hark (hark-memory@claude-plugins-official for a directory install)'])
+    expect(w.env.every(name => ['CLAUDE_BG_SOURCE', 'HOME', 'USERPROFILE'].includes(name))).toBe(true)
   })
 
-  test("accepts HARK_PAT and a .hark file (venture=V-###), as Hark's own installer writes them", async ($, on) => {
-    mock.env(on, { HARK_PAT: 'pat' })
+  test('trims the access key, and /hark works before session.start', { options: { access_key: '  tok \n' } }, async ($, on) => {
+    mock.clock(on)
+    const w = world(on, { hark: healthy })
+
+    const { text } = await $.command.run(COMMAND('brief'))
+
+    expect(text).toStartWith('**Hark V-012** · Open · 2 need you')
+    expect(w.calls.map(c => c.headers.authorization)).toEqual(['Bearer tok', 'Bearer tok']) // the boot's brief, then /hark brief
+  })
+
+  test("accepts a .hark file (venture=V-###), as Hark's own installer writes it", { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { files: { '/work/.hark': 'venture=V-034\n' }, hark: healthy })
 
@@ -73,11 +93,10 @@ describe('brief', () => {
     await block($)
 
     expect(w.calls[0]?.args.venture).toBe('V-034')
-    expect(w.calls[0]?.headers.authorization).toBe('Bearer pat')
+    expect(w.calls[0]?.headers.authorization).toBe('Bearer tok')
   })
 
-  test('HARK_TOKEN wins over HARK_PAT, and the nearest project file wins', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HARK_PAT: 'pat' })
+  test('the nearest project file wins', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { cwd: '/work/app', files: { '/work/app/.hark/project': 'V-001', '/work/.hark': 'venture=V-034' }, hark: healthy })
 
@@ -85,11 +104,9 @@ describe('brief', () => {
     await block($)
 
     expect(w.calls[0]?.args.venture).toBe('V-001')
-    expect(w.calls[0]?.headers.authorization).toBe('Bearer tok')
   })
 
-  test('finds .hark/project in a parent folder and works relative to it', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('finds .hark/project in a parent folder and works relative to it', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { cwd: '/work/packages/app', hark: healthy })
 
@@ -100,8 +117,7 @@ describe('brief', () => {
     expect(w.asks[0]?.question).toContain('Edit src/db/users.ts')
   })
 
-  test('does nothing outside a Hark project', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('does nothing outside a Hark project', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { project: null, hark: healthy })
 
@@ -116,8 +132,7 @@ describe('brief', () => {
     expect(reply.text).toContain('hark init')
   })
 
-  test('fails open with one log line when Hark is down', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('fails open with one log line when Hark is down', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: () => ({ status: 503, text: 'down' }) })
 
@@ -132,8 +147,7 @@ describe('brief', () => {
     expect(w.statuses).toEqual(['Hark V-012 · offline', 'Hark V-012 · offline'])
   })
 
-  test('a hung server is cut off after 3 s', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('a hung server is cut off after 3 s', { options: { access_key: 'tok' } }, async ($, on) => {
     const clock = mock.clock(on)
     const w = world(on, { hark: async () => (await clock.sleep(60_000), healthy('get_agent_brief')) })
 
@@ -145,8 +159,7 @@ describe('brief', () => {
     expect(w.logs).toEqual(['hark: brief unavailable (no reply in 3000ms)'])
   })
 
-  test('reads a streamed (SSE) reply', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('reads a streamed (SSE) reply', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const sse = `id: 0\ndata:\n\nevent: message\ndata: {"jsonrpc":"2.0","method":"notifications/progress"}\n\nevent: message\ndata: ${rpc(1, BRIEF)}\n\n`
     world(on, { hark: () => ({ text: sse, headers: { 'content-type': 'text/event-stream' } }) })
@@ -156,8 +169,7 @@ describe('brief', () => {
     expect((await block($))[1]?.text).toContain('"identity"')
   })
 
-  test('shows Draft when an earlier session left a draft handoff', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('shows Draft when an earlier session left a draft handoff', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: () => ({ result: { ...BRIEF, handoff: { ...BRIEF.handoff, draft: { session_id: 'x' } } } }) })
 
@@ -169,8 +181,7 @@ describe('brief', () => {
 })
 
 describe('compaction', () => {
-  test('re-injects the sub-brief: decisions, non-goals, blockers, next action', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('re-injects the sub-brief: decisions, non-goals, blockers, next action', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy })
 
@@ -189,8 +200,7 @@ describe('compaction', () => {
     expect(recap).not.toContain('Polish receipts')
   })
 
-  test('keeps the first brief when the refresh fails; ignores precompute, subagents and skipped compactions', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('keeps the first brief when the refresh fails; ignores precompute, subagents and skipped compactions', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     let up = true
     on('session.compact', { trigger: 'plugin' }, () => ({ skip: 'not now' }))
@@ -211,8 +221,7 @@ describe('compaction', () => {
 })
 
 describe('edit guard', () => {
-  test('asks once per decision, with its title and why; Allow is remembered', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('asks once per decision, with its title and why; Allow is remembered', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy, answer: () => 'Allow' })
 
@@ -228,8 +237,7 @@ describe('edit guard', () => {
     expect(w.tools()).toEqual(['get_agent_brief', 'list_journal_entries'])
   })
 
-  test('Stop refuses the edit with the decision, and asks again next time', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('Stop refuses the edit with the decision, and asks again next time', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy, answer: () => 'Stop' })
 
@@ -241,8 +249,7 @@ describe('edit guard', () => {
     expect(w.asks).toHaveLength(2)
   })
 
-  test('reads scope from titles, body lines and non-goals; skips unscoped or unaccepted records', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('reads scope from titles, body lines and non-goals; skips unscoped or unaccepted records', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy, answer: () => 'Allow' })
 
@@ -259,8 +266,7 @@ describe('edit guard', () => {
     expect(w.asks[0]?.question).toContain('Why: One reconciliation path.\n\n')
   })
 
-  test("prefers Hark's structured scope field over a marker in the text", async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test("prefers Hark's structured scope field over a marker in the text", { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy, answer: () => 'Allow' })
 
@@ -271,8 +277,7 @@ describe('edit guard', () => {
     expect(w.asks.map(a => a.question.split('\n')[0])).toEqual(['Decision "Infra via Terraform" covers this edit.'])
   })
 
-  test('one question lists every matching record; Allow covers them all', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('one question lists every matching record; Allow covers them all', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy, answer: () => 'Allow' })
 
@@ -285,8 +290,7 @@ describe('edit guard', () => {
     expect(w.asks[0]?.question).toContain('Decision "Stripe is the only processor" covers this edit.')
   })
 
-  test('an area covers files under a directory of that name, never the changed text (the "booking" false positive)', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('an area covers files under a directory of that name, never the changed text (the "booking" false positive)', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy, answer: () => 'Stop' }) // Stop, so every matching edit asks again
     const first = (q: { question: string }) => q.question.split('\n\n').filter(l => l.includes('covers this edit')).map(l => l.split(' covers')[0])
@@ -300,8 +304,7 @@ describe('edit guard', () => {
     expect(w.asks.map(first)).toEqual([['Decision "Stripe is the only processor"'], ['Decision "Add a waitlist when a lesson is full"']])
   })
 
-  test("Hark's scope.paths decide alone: areas then map to those paths", async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test("Hark's scope.paths decide alone: areas then map to those paths", { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const entries = [
       { id: 'p1', title: 'Payments live in one place', rationale: 'One audit trail', acceptance: 'accepted', scope: { areas: ['billing'], paths: ['payments/**'] } },
@@ -315,8 +318,7 @@ describe('edit guard', () => {
     expect(w.asks.map(a => a.question.split('\n\n').at(-2))).toEqual(['Edit payments/a.ts (-1 +1 lines)', 'Edit infra/main.tf (-1 +1 lines)'])
   })
 
-  test('a dismissed question lets the edit through and says so', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('a dismissed question lets the edit through and says so', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy, answer: () => null })
 
@@ -327,8 +329,7 @@ describe('edit guard', () => {
     expect(w.logs).toEqual(['hark: could not ask about Decision "Raw SQL, no ORM"; the edit went ahead'])
   })
 
-  test('parallel edits each ask for themselves', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('parallel edits each ask for themselves', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy, answer: () => 'Stop' })
 
@@ -340,8 +341,7 @@ describe('edit guard', () => {
     expect(b.deny).toContain('Stopped by the user')
   })
 
-  test('NotebookEdit is guarded; edits outside the project are neither guarded nor recorded', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('NotebookEdit is guarded; edits outside the project are neither guarded nor recorded', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy, answer: () => 'Allow' })
 
@@ -355,8 +355,7 @@ describe('edit guard', () => {
     expect(w.sent()).not.toContain('/Users/me')
   })
 
-  test('decisions that fail to load are retried a minute later, not on every edit', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('decisions that fail to load are retried a minute later, not on every edit', { options: { access_key: 'tok' } }, async ($, on) => {
     const clock = mock.clock(on)
     let up = false
     const w = world(on, { hark: tool => (tool === 'get_agent_brief' || up ? healthy(tool) : undefined), answer: () => 'Allow' })
@@ -375,13 +374,8 @@ describe('edit guard', () => {
 })
 
 describe('handoff', () => {
-  const COMMIT = '[main abc1234def] Add the guard\n 1 file changed'
-  const bash = (cmd: string) => cmd.startsWith('git commit')
-    ? { result: { stdout: `[INFO] token=abc\n${COMMIT}`, stderr: '', interrupted: false, gitOperation: { commit: { sha: 'abc1234def', kind: 'committed' } } } }
-    : { result: { stdout: 'tests ok', stderr: '', interrupted: false }, isError: cmd.includes('pytest') }
 
-  test('end_session carries files, commits, tests and agent notes, never contents', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('end_session carries files, commits, tests and agent notes, never contents', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy, bash })
 
@@ -407,10 +401,10 @@ describe('handoff', () => {
     expect(w.statuses.at(-1)).toBe('Hark V-012 · Clean · 2 need you')
   })
 
-  test('agent notes lose credentials, open or tilde code fences and the access key', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok-9f8e7d6c5b4a' })
+  test('agent notes and commit subjects lose credentials, open or tilde code fences and the access key, on the wire and on disk', { options: { access_key: 'tok-9f8e7d6c5b4a' } }, async ($, on) => {
     mock.clock(on)
-    const w = world(on, { hark: healthy })
+    const rotate = { result: { stdout: '[main abc1234] Rotate tok-9f8e7d6c5b4a out\n', stderr: '', interrupted: false, gitOperation: { commit: { sha: 'abc1234', kind: 'committed' } } } }
+    const w = world(on, { env: { HOME }, hark: healthy, bash: () => rotate })
     const notes = [
       'Wired Stripe: set STRIPE_SECRET_KEY=sk_live_51Hxyzabcdefghij and DATABASE_URL=postgres://admin:hunter2@db.internal/prod.',
       'The key tok-9f8e7d6c5b4a works.',
@@ -421,17 +415,19 @@ describe('handoff', () => {
 
     await $.session.start(SESSION)
     await $.tool.call(EDIT('src/app.ts'))
+    await $.tool.call({ tool: 'Bash', command: 'git commit -am "Rotate the key"' })
     await $.turn.complete(TURN(notes))
+    expect(Object.values(w.files).join('\n')).not.toContain('tok-9f8e')
     await $.turn.complete(TURN('partial ```ts\nconst leaked = 1', { reason: 'aborted', isAborted: true }))
     await $.turn.complete(TURN('subagent notes', { agentId: 'a1' }))
     await $.session.end(END())
 
     expect(w.sent()).not.toMatch(/sk_live|hunter2|tok-9f8e|b3Blbn|s3cr3t|leaked|subagent notes/)
     expect(w.calls.find(c => c.tool === 'end_session')?.args.what_i_did).toContain('Wired Stripe: set [redacted] and DATABASE_URL=postgres://[redacted]@db.internal/prod.')
+    expect(w.calls.find(c => c.tool === 'end_session')?.args.what_changed).toBe('edited src/app.ts\ncommit abc1234 Rotate [redacted] out')
   })
 
-  test('without a Next steps section, whats_next comes from what happened; links stop at 10, PRs first', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('without a Next steps section, whats_next comes from what happened; links stop at 10, PRs first', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const pr = { result: { stdout: '', stderr: '', interrupted: false, gitOperation: { pr: { number: 7, url: 'https://github.com/o/r/pull/7', action: 'created' } } } }
     const w = world(on, { hark: healthy, bash: () => pr })
@@ -448,8 +444,7 @@ describe('handoff', () => {
     expect(w.tools()).toEqual(['get_agent_brief', 'list_journal_entries', 'end_session'])
   })
 
-  test('falls back to session_stopped when Hark refuses end_session', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('falls back to session_stopped when Hark refuses end_session', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: tool => (tool === 'end_session' ? { result: 'plan cap reached', isError: true } : healthy(tool)) })
 
@@ -465,8 +460,7 @@ describe('handoff', () => {
     expect(w.logs).toEqual(['hark: end_session failed ("plan cap reached")'])
   })
 
-  test('a timed-out end_session is not followed by session_stopped', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('a timed-out end_session is not followed by session_stopped', { options: { access_key: 'tok' } }, async ($, on) => {
     const clock = mock.clock(on)
     const w = world(on, { hark: async tool => (tool === 'end_session' ? (await clock.sleep(60_000), undefined) : healthy(tool)) })
 
@@ -481,8 +475,7 @@ describe('handoff', () => {
     expect(w.logs[0]).toMatch(/^hark: end_session failed \(no reply in 9[56]\d\dms\)$/)
   })
 
-  test('a session without edits, commits or tests closes without a handoff', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('a session without edits, commits or tests closes without a handoff', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy })
 
@@ -494,8 +487,7 @@ describe('handoff', () => {
     expect(w.tools()).toEqual(['get_agent_brief', 'close_session'])
   })
 
-  test('skips its own handoff when the agent already wrote one, but not when that failed', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('skips its own handoff when the agent already wrote one, but not when that failed', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     let fails = true
     on('tool.call', { tool: 'mcp__hark__end_session' }, () => (fails ? { isError: true, result: 'invalid', text: 'invalid' } : { result: 'ok', text: 'ok' }) as never)
@@ -515,8 +507,7 @@ describe('handoff', () => {
     expect(w.tools()).toEqual(['get_agent_brief', 'list_journal_entries', 'close_session'])
   })
 
-  test('/clear and resume hand off, forget Allow answers, and the next conversation gets a full brief', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('/clear and resume hand off, forget Allow answers, and the next conversation gets a full brief', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy, answer: () => 'Allow' })
 
@@ -536,8 +527,7 @@ describe('handoff', () => {
 })
 
 describe('/hark', () => {
-  test('brief prints a readable brief', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('brief prints a readable brief', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     world(on, { hark: healthy })
 
@@ -548,8 +538,7 @@ describe('/hark', () => {
     expect(text).toContain('Next action:\n- Wire Rialto swaps\n- Polish receipts')
   })
 
-  test('needs lists proposals and updates the count', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('needs lists proposals and updates the count', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy })
 
@@ -561,8 +550,7 @@ describe('/hark', () => {
     expect(w.statuses.at(-1)).toBe('Hark V-012 · Open · 3 need you')
   })
 
-  test('open resolves the project page once and opens it', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('open resolves the project page once and opens it', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy })
 
@@ -575,8 +563,22 @@ describe('/hark', () => {
     expect(w.tools().filter(t => t === 'get_venture')).toHaveLength(1)
   })
 
-  test('handoff ends the session now, exit adds nothing; unknown words print usage', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('open falls back to xdg-open, and gives the link when neither opens it', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on)
+    let xdg = 0
+    const w = world(on, { hark: healthy, run: argv => (argv[0] === 'open' ? { exitCode: 127 } : argv[0] === 'xdg-open' ? { exitCode: xdg } : undefined) })
+
+    await $.session.start(SESSION)
+    const first = await $.command.run(COMMAND('open'))
+    xdg = 3
+    const second = await $.command.run(COMMAND('open'))
+
+    const url = `https://harkstudio.io/ventures/${UUID}`
+    expect(w.runs.filter(r => r[0] === 'open' || r[0] === 'xdg-open')).toEqual([['open', url], ['xdg-open', url], ['open', url], ['xdg-open', url]])
+    expect([first.text, second.text]).toEqual([`Opened [V-012 on Hark](${url})`, `Open [V-012 on Hark](${url})`])
+  })
+
+  test('handoff ends the session now, exit adds nothing; unknown words print usage', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy })
 
@@ -605,10 +607,9 @@ describe('one conversation across processes', () => {
   })
   const project = { '/work/.hark/project': 'V-012\n' }
 
-  test('saves the conversation to ~/.claude/hark/<key>.json as work happens', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test('saves the conversation to ~/.claude/hark/<key>.json as work happens', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const w = world(on, { hark: healthy })
+    const w = world(on, { env: { HOME }, hark: healthy })
 
     await $.session.start(SESSION)
     await block($)
@@ -621,11 +622,30 @@ describe('one conversation across processes', () => {
     expect(w.runs).toContainEqual(['mkdir', '-p', '-m', '700', `${HOME}/.claude/hark`]) // private to this user
   })
 
-  test('a second process resumes it: no new brief under 30 minutes, the cached one is injected, earlier work is handed off', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test('makes the state folder private with mkdir -m 700, then chmod 700', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const w = world(on, { env: { HOME }, hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($)
+
+    expect(w.runs.slice(0, 2)).toEqual([['mkdir', '-p', '-m', '700', `${HOME}/.claude/hark`], ['chmod', '700', `${HOME}/.claude/hark`]])
+  })
+
+  test('uses USERPROFILE when HOME is unset (Windows)', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const w = world(on, { env: { USERPROFILE: HOME }, hark: healthy })
+
+    await $.session.start(SESSION)
+    await $.tool.call({ tool: 'Write', file_path: '/work/src/app.ts', content: 'x' })
+
+    expect(JSON.parse(w.files[stateFile(await keyOf())] ?? '{}')).toMatchObject({ files: ['src/app.ts'] })
+  })
+
+  test('a second process resumes it: no new brief under 30 minutes, the cached one is injected, earlier work is handed off', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     const key = await keyOf()
-    const w = world(on, { sessionId: 'background', files: { ...project, [stateFile(key)]: saved() }, hark: healthy, answer: () => 'Stop' })
+    const w = world(on, { env: { HOME }, sessionId: 'background', files: { ...project, [stateFile(key)]: saved() }, hark: healthy, answer: () => 'Stop' })
 
     const blocks = await block($) // a background process rebuilds its context before session.start
     await $.session.start(SESSION)
@@ -644,10 +664,9 @@ describe('one conversation across processes', () => {
     expect(JSON.parse(w.files[stateFile(key)] ?? '{}')).toMatchObject({ id: ID, closed: true, opened: false, latest: 'background', sessions: ['first-process', 'background'] })
   })
 
-  test('the brief is fetched again once the state is over 30 minutes old, however recent the brief', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test('the brief is fetched again once the state is over 30 minutes old, however recent the brief', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const w = world(on, { files: { ...project, [stateFile(await keyOf())]: saved({ updatedAt: NOW - 31 * 60_000, briefAt: NOW - 31 * 60_000 }) }, hark: healthy })
+    const w = world(on, { env: { HOME }, files: { ...project, [stateFile(await keyOf())]: saved({ updatedAt: NOW - 31 * 60_000, briefAt: NOW - 31 * 60_000 }) }, hark: healthy })
 
     await $.session.start(SESSION)
     await block($)
@@ -655,10 +674,9 @@ describe('one conversation across processes', () => {
     expect(w.tools()).toEqual(['get_agent_brief'])
   })
 
-  test('a busy conversation reuses its brief, however old the brief, while the state is fresh', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test('a busy conversation reuses its brief, however old the brief, while the state is fresh', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const w = world(on, { files: { ...project, [stateFile(await keyOf())]: saved({ briefAt: NOW - 3 * 60 * 60_000 }) }, hark: healthy })
+    const w = world(on, { env: { HOME }, files: { ...project, [stateFile(await keyOf())]: saved({ briefAt: NOW - 3 * 60 * 60_000 }) }, hark: healthy })
 
     await $.session.start(SESSION)
     await block($)
@@ -666,10 +684,9 @@ describe('one conversation across processes', () => {
     expect(w.calls).toEqual([])
   })
 
-  test('once another process handed off, this one sends nothing for the same work', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test('once another process handed off, this one sends nothing for the same work', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const w = world(on, { files: { ...project, [stateFile(await keyOf())]: saved({ closed: true, opened: false, handoff: 'Clean' }) }, hark: healthy })
+    const w = world(on, { env: { HOME }, files: { ...project, [stateFile(await keyOf())]: saved({ closed: true, opened: false, handoff: 'Clean' }) }, hark: healthy })
 
     await $.session.start(SESSION)
     const reply = await $.command.run(COMMAND('handoff'))
@@ -679,11 +696,10 @@ describe('one conversation across processes', () => {
     expect(w.calls).toEqual([])
   })
 
-  test('only the process that wins the lock hands a segment off', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test('only the process that wins the lock hands a segment off', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     const key = await keyOf()
-    const w = world(on, { files: { ...project, [stateFile(key)]: saved() }, hark: healthy })
+    const w = world(on, { env: { HOME }, files: { ...project, [stateFile(key)]: saved() }, hark: healthy })
     const lock = stateFile(key).replace(/\.json$/, '.0.lock')
     w.dirs.add(lock) // another process is handing it off right now
     w.lockTimes.set(lock, NOW - 5_000)
@@ -695,11 +711,10 @@ describe('one conversation across processes', () => {
     expect(w.calls).toEqual([])
   })
 
-  test('a lock left behind by a process that died mid-handoff expires', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test('a lock left behind by a process that died mid-handoff expires', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     const key = await keyOf()
-    const w = world(on, { files: { ...project, [stateFile(key)]: saved() }, hark: healthy })
+    const w = world(on, { env: { HOME }, files: { ...project, [stateFile(key)]: saved() }, hark: healthy })
     const lock = stateFile(key).replace(/\.json$/, '.0.lock')
     w.dirs.add(lock)
     w.lockTimes.set(lock, NOW - 60_000)
@@ -710,11 +725,10 @@ describe('one conversation across processes', () => {
     expect(reply.text).toBe('Handoff saved to Hark (V-012).')
   })
 
-  test('work recorded while end_session is in flight is not lost: it opens the next segment', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test('work recorded while end_session is in flight is not lost: it opens the next segment', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     const key = await keyOf()
-    const w = world(on, {
+    const w = world(on, { env: { HOME },
       files: { ...project, [stateFile(key)]: saved() },
       hark: (tool, args) => {
         if (tool === 'end_session' && !String(args.what_changed).includes('late.ts')) {
@@ -735,10 +749,9 @@ describe('one conversation across processes', () => {
     expect(w.calls.filter(c => c.tool === 'end_session').map(c => c.args.what_changed)).toEqual(['edited src/a.ts', 'edited src/late.ts'])
   })
 
-  test('a corrupt state file is ignored, not fatal', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test('a corrupt state file is ignored, not fatal', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const w = world(on, { files: { ...project, [stateFile(await keyOf())]: JSON.stringify({ files: null, notes: 7, segment: 'x', allowed: 'd2' }) }, hark: healthy })
+    const w = world(on, { env: { HOME }, files: { ...project, [stateFile(await keyOf())]: JSON.stringify({ files: null, notes: 7, segment: 'x', allowed: 'd2' }) }, hark: healthy })
 
     await $.session.start(SESSION)
     await block($)
@@ -749,11 +762,10 @@ describe('one conversation across processes', () => {
     expect(w.logs).toEqual([])
   })
 
-  test("the agent's own end_session closes the shared state, in every process", async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test("the agent's own end_session closes the shared state, in every process", { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     const key = await keyOf()
-    const w = world(on, { files: { ...project, [stateFile(key)]: saved() }, hark: healthy })
+    const w = world(on, { env: { HOME }, files: { ...project, [stateFile(key)]: saved() }, hark: healthy })
 
     await $.session.start(SESSION)
     await $.tool.call({ tool: 'mcp__hark__end_session', venture: 'V-012', what_i_did: 'x', what_changed: 'y', whats_next: 'z' } as never)
@@ -761,25 +773,22 @@ describe('one conversation across processes', () => {
     expect(JSON.parse(w.files[stateFile(key)] ?? '{}')).toMatchObject({ closed: true, handoff: 'Clean' })
   })
 
-  test('honours CLAUDE_CONFIG_DIR, and an Allow is saved before the edit runs', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME, CLAUDE_CONFIG_DIR: '/cfg' })
+  test('the state lives in ~/.claude/hark whatever CLAUDE_CONFIG_DIR says, and an Allow is saved before the edit runs', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     on('tool.call', { tool: 'Edit' }, () => ({ isError: true, result: 'String not found', text: 'String not found' }) as never)
-    const w = world(on, { hark: healthy, answer: () => 'Allow' })
+    const w = world(on, { env: { HOME, CLAUDE_CONFIG_DIR: '/cfg' }, hark: healthy, answer: () => 'Allow' })
 
     await $.session.start(SESSION)
     await $.tool.call(EDIT('src/db/users.ts'))
 
-    const file = `/cfg/hark/${await keyOf()}.json`
-    expect(JSON.parse(w.files[file] ?? '{}')).toMatchObject({ allowed: ['d2'], files: [] })
-    expect(Object.keys(w.files).some(f => f.startsWith(HOME))).toBe(false)
+    expect(JSON.parse(w.files[stateFile(await keyOf())] ?? '{}')).toMatchObject({ allowed: ['d2'], files: [] })
+    expect(Object.keys(w.files).some(f => f.startsWith('/cfg'))).toBe(false)
   })
 
-  test('repeated test runs are each counted, in order', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test('repeated test runs are each counted, in order', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     let run = 0
-    const w = world(on, { hark: healthy, bash: () => ({ result: { stdout: '', stderr: '', interrupted: false }, isError: [true, false, true][run++] }) })
+    const w = world(on, { env: { HOME }, hark: healthy, bash: () => ({ result: { stdout: '', stderr: '', interrupted: false }, isError: [true, false, true][run++] }) })
 
     await $.session.start(SESSION)
     for (let i = 0; i < 3; i++) await $.tool.call({ tool: 'Bash', command: 'npm test' })
@@ -789,12 +798,11 @@ describe('one conversation across processes', () => {
     expect(did).toStartWith('Claude Code session: 0 file(s) edited, 0 commit(s), 3 test run(s).\nTests npm test: failed\nTests npm test: passed\nTests npm test: failed')
   })
 
-  test('the original process stays quiet once the conversation moved to a background process', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test('the original process stays quiet once the conversation moved to a background process', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     const rows = (...types: string[]) => types.map(type => JSON.stringify({ type })).join('\n')
     const moved = '/t/moved.jsonl', back = '/t/back.jsonl'
-    const w = world(on, {
+    const w = world(on, { env: { HOME },
       files: { ...project, [moved]: rows('user', 'assistant', 'continued-in', 'user'), [back]: rows('user', 'continued-in', 'assistant') },
       hark: healthy,
     })
@@ -812,11 +820,25 @@ describe('one conversation across processes', () => {
     expect(w.tools()).toEqual(['get_agent_brief', 'list_journal_entries', 'end_session'])
   })
 
-  test('with an unreadable transcript, a later process joining the conversation counts as a move', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test('without a tail command, the transcript is read whole to see the move', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const moved = '/t/moved.jsonl'
+    const w = world(on, { env: { HOME }, files: { ...project, [moved]: ['user', 'assistant', 'continued-in'].map(type => JSON.stringify({ type })).join('\n') },
+      hark: healthy, run: argv => (argv[0] === 'tail' ? { exitCode: 127 } : undefined) })
+
+    await $.session.start(SESSION)
+    await $.tool.call({ tool: 'Write', file_path: '/work/src/app.ts', content: 'x' })
+    await $.classic.SessionEnd({ reason: 'other', transcript_path: moved })
+    await $.session.end(END())
+
+    expect(w.reads).toContain(moved)
+    expect(w.tools()).not.toContain('end_session')
+  })
+
+  test('with an unreadable transcript, a later process joining the conversation counts as a move', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     const key = await keyOf()
-    const w = world(on, { hark: healthy })
+    const w = world(on, { env: { HOME }, hark: healthy })
 
     await $.session.start(SESSION)
     await block($)
@@ -828,8 +850,7 @@ describe('one conversation across processes', () => {
     expect(w.tools()).toEqual(['get_agent_brief', 'list_journal_entries'])
   })
 
-  test('without a shared state file, the original still hands off after a move', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok' })
+  test('without a shared state file, the original still hands off after a move', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     const w = world(on, { files: { ...project, '/t/moved.jsonl': ['user', 'assistant', 'continued-in'].map(type => JSON.stringify({ type })).join('\n') }, hark: healthy })
 
@@ -841,10 +862,9 @@ describe('one conversation across processes', () => {
     expect(w.tools()).toContain('end_session')
   })
 
-  test("the agent view's empty placeholder calls Hark only once it gets a prompt", async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME, CLAUDE_BG_SOURCE: 'spare' })
+  test("the agent view's empty placeholder calls Hark only once it gets a prompt", { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const w = world(on, { hark: healthy })
+    const w = world(on, { env: { HOME, CLAUDE_BG_SOURCE: 'spare' }, hark: healthy })
 
     expect(await block($)).toHaveLength(1) // claimed: its context is computed with no prompt
     await $.session.start(SESSION)
@@ -858,11 +878,21 @@ describe('one conversation across processes', () => {
     expect(w.tools()).toEqual(['get_agent_brief', 'close_session'])
   })
 
-  test('new work after a handoff starts a new segment, handed off on its own', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test('a placeholder that already got a prompt is a live conversation: after a reload it starts at once', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const w = world(on, { env: { HOME, CLAUDE_BG_SOURCE: 'spare' }, turns: 1, hark: healthy })
+
+    await $.session.start(SESSION)
+    await $.tool.call({ tool: 'Write', file_path: '/work/src/app.ts', content: 'x' })
+    await $.session.end(END())
+
+    expect(w.tools()).toEqual(['get_agent_brief', 'list_journal_entries', 'end_session'])
+  })
+
+  test('new work after a handoff starts a new segment, handed off on its own', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     const key = await keyOf()
-    const w = world(on, { hark: healthy })
+    const w = world(on, { env: { HOME }, hark: healthy })
 
     await $.session.start(SESSION)
     await block($)
@@ -876,11 +906,10 @@ describe('one conversation across processes', () => {
     expect(w.runs.filter(r => r[0] === 'mkdir' && !r.includes('-p')).map(r => r[1])).toEqual([0, 1].map(n => stateFile(key).replace(/\.json$/, `.${n}.lock`)))
   })
 
-  test('/clear starts a new conversation with its own key and state', async ($, on) => {
-    mock.env(on, { HARK_TOKEN: 'tok', HOME })
+  test('/clear starts a new conversation with its own key and state', { options: { access_key: 'tok' } }, async ($, on) => {
     const clock = mock.clock(on, { now: NOW })
     let started = STARTED
-    const w = world(on, { started: () => started, hark: healthy })
+    const w = world(on, { env: { HOME }, started: () => started, hark: healthy })
 
     await $.session.start(SESSION)
     await block($)

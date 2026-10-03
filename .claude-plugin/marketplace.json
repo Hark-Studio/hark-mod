@@ -8,7 +8,7 @@
   "description": "Hark — shared project memory for Claude Code",
   "plugins": [
     {
-      "name": "hark",
+      "name": "hark-memory",
       "source": "./",
       "description": "Brings your Hark project brief into every session, keeps the plan through compaction, checks edits against accepted decisions, and writes the handoff when you stop.",
       "homepage": "https://github.com/Hark-Studio/hark-mod",
