@@ -5,6 +5,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const APP = 'https://harkstudio.io'
+const CLIENT = 'claude-code-mod' // X-Hark-Client header and params._meta.client on every request
 const CODE = /\b(V-\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i
 const TESTS = /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test|(?:go|cargo|deno|mix|dotnet|swift|make)\s+test|python3?\s+-m\s+(?:pytest|unittest)|pytest|vitest|jest|mocha|rspec|phpunit|tox|claude\s+plugin\s+test)\b/
 const NEXT = /^\W*(?:#+\s*)?(?:\*\*)?next (?:steps?|up)\b[^\w\n]*/i
@@ -17,11 +18,11 @@ const INTRO = 'Hark project brief, read at session start. The hark plugin record
 
 type Rule = { id: string; title: string; why: string; scope: string[] }
 type Activity = { files: Set<string>; commits: string[]; tests: string[]; links: string[]; notes: string }
-type Hark = { ready: Promise<boolean> | null; root: string; code: string; token: string; rpc: number; uuid: string
+type Hark = { ready: Promise<boolean> | null; root: string; code: string; token: string; agent: string; rpc: number; uuid: string
   brief: Promise<unknown> | null; recap: boolean; opened: boolean; rules: Promise<Rule[]> | null; retry: number
   allowed: Set<string>; handoff: 'Open' | 'Draft' | 'Clean'; needs: number; act: Activity; logged: Set<string> }
 const activity = (): Activity => ({ files: new Set(), commits: [], tests: [], links: [], notes: '' })
-const fresh = (): Hark => ({ ready: null, root: '', code: '', token: '', rpc: 0, uuid: '', brief: null, recap: false, opened: false,
+const fresh = (): Hark => ({ ready: null, root: '', code: '', token: '', agent: '', rpc: 0, uuid: '', brief: null, recap: false, opened: false,
   rules: null, retry: 0, allowed: new Set(), handoff: 'Open', needs: 0, act: activity(), logged: new Set() })
 const o = (v: unknown): Record<string, any> => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, any>) : {})
 const a = (v: unknown): unknown[] => (Array.isArray(v) ? v : v == null || v === '' ? [] : [v])
@@ -133,6 +134,10 @@ async function boot($: EngineInterface, s: Hark): Promise<boolean> {
       || (await run($, ['security', 'find-generic-password', '-s', 'hark', '-w']))
       || (await run($, ['secret-tool', 'lookup', 'service', 'hark'])) || ''
     if (!s.token) return note($, s, 'no access key; set HARK_TOKEN or HARK_PAT (or, on macOS and Linux, a "hark" keychain item)'), false
+    // Requests name the mod and the engine: User-Agent hark-mod/<plugin.json version> (claude-code/<runtime version>)
+    const manifest = o(parse(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`).catch(() => ''), null))
+    const runtime = await $.session.version().then(v => v.version, () => 'unknown')
+    s.agent = `hark-mod/${manifest.version ?? 'unknown'} (claude-code/${runtime})`
     s.brief = brief($, s)
     return true
   } catch (err) { return note($, s, `setup failed (${errText(err)})`), false }
@@ -140,8 +145,11 @@ async function boot($: EngineInterface, s: Hark): Promise<boolean> {
 
 // MCP over HTTP, stateless: each call is one JSON-RPC tools/call POST, as Hark's own hooks send it.
 async function call($: EngineInterface, s: Hark, tool: string, args: Record<string, unknown>, ms = 3000): Promise<unknown> {
-  const req = { jsonrpc: '2.0', id: ++s.rpc, method: 'tools/call', params: { name: tool, arguments: args } }
-  const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${s.token}` }
+  const req = { jsonrpc: '2.0', id: ++s.rpc, method: 'tools/call', params: { name: tool, arguments: args, _meta: { client: CLIENT } } }
+  const headers = {
+    'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${s.token}`,
+    'user-agent': s.agent, 'x-hark-client': CLIENT,
+  }
   const wait = Math.max(100, ms)
   const late = $.clock.sleep(wait).then(() => Promise.reject(new Error(`no reply in ${wait}ms`)), () => new Promise<never>(() => {}))
   const res = await Promise.race([$.http.fetch(`${APP}/mcp`, { method: 'POST', headers, body: JSON.stringify(req) }), late])

@@ -4,6 +4,9 @@ import type { On } from 'claude-code'
 export const ENDPOINT = 'https://harkstudio.io/mcp'
 export const ROOT = '/work'
 export const UUID = 'b409db7e-ea4c-4229-8a55-03eab8865d8f'
+export const RUNTIME = '2.1.288'
+// The plugin's own manifest as the host returns it (the test environment has no file system).
+export const MANIFEST = { name: 'hark', version: '0.1.0' }
 
 // The compact brief, shaped like a real get_agent_brief reply.
 export const BRIEF = {
@@ -58,7 +61,7 @@ export function world(
   } = {},
 ) {
   const w = {
-    calls: [] as Call[], runs: [] as string[][], statuses: [] as (string | undefined)[], logs: [] as string[],
+    calls: [] as Call[], reads: [] as string[], runs: [] as string[][], statuses: [] as (string | undefined)[], logs: [] as string[],
     asks: [] as { question: string; header?: string; options: string[] }[], invalidated: [] as string[], commands: [] as string[],
   }
   const tools = () => w.calls.map(c => c.tool)
@@ -66,7 +69,12 @@ export function world(
 
   on('session.root', () => ({ value: opts.cwd ?? ROOT }))
   const files = opts.files ?? (opts.project === null ? {} : { [`${ROOT}/.hark/project`]: opts.project ?? 'V-012\n' })
-  on('fs.read', ($, e) => (e.path in files ? { value: files[e.path] as string } : { deny: `ENOENT: ${e.path}` }))
+  on('fs.read', ($, e) => {
+    w.reads.push(e.path)
+    if (e.path.endsWith('/.claude-plugin/plugin.json')) return { value: JSON.stringify(MANIFEST) }
+    return e.path in files ? { value: files[e.path] as string } : { deny: `ENOENT: ${e.path}` }
+  })
+  on('session.version', () => ({ value: { version: RUNTIME, base: RUNTIME } }))
   on('process.run', ($, e) => {
     w.runs.push([...e.argv])
     const found = e.argv[0] === 'security' && opts.keychain !== undefined

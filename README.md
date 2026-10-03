@@ -106,10 +106,11 @@ Claude Code gives all exit hooks together about 1.5 seconds. The plugin sends on
 
 ## Every outbound request
 
-All network traffic is HTTPS `POST https://harkstudio.io/mcp`: one stateless MCP JSON-RPC `tools/call` per request. The headers are `Content-Type: application/json`, `Accept: application/json, text/event-stream` and `Authorization: Bearer <your access key>`. Each request is abandoned after 3 seconds. At exit the limit is shorter: the rest of the exit window, minus 0.4 seconds.
+All network traffic is HTTPS `POST https://harkstudio.io/mcp`: one stateless MCP JSON-RPC `tools/call` per request. Each request is abandoned after 3 seconds. At exit the limit is shorter: the rest of the exit window, minus 0.4 seconds.
 
 | Tool | When | Arguments sent |
 | --- | --- | --- |
+| *every request below* | Always | Headers `Content-Type: application/json`, `Accept: application/json, text/event-stream`, `Authorization: Bearer <your access key>`, `User-Agent: hark-mod/<version> (claude-code/<version>)` (the plugin's version from `plugin.json` and the Claude Code version, for example `hark-mod/0.1.0 (claude-code/2.1.288)`), `X-Hark-Client: claude-code-mod`; and in the JSON-RPC body, `params._meta.client: "claude-code-mod"` beside the tool's `name` and `arguments` |
 | `get_agent_brief` | Session start; after each compaction; `/hark brief`; the first message after `/clear` or a resume | `venture` (project code), `depth: "compact"` |
 | `list_journal_entries` | The first guarded edit of a session, and the first after each compaction; a minute after a failed attempt | `venture`, `kind: "decision"`, `limit: 200` |
 | `list_candidates` | `/hark needs` | `venture` |

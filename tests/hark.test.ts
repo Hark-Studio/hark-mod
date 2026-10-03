@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { BRIEF, COMMAND, EDIT, END, ENDPOINT, MESSAGES, SESSION, TURN, UUID, healthy, rpc, world } from './world'
+import { BRIEF, COMMAND, EDIT, END, ENDPOINT, MANIFEST, MESSAGES, RUNTIME, SESSION, TURN, UUID, healthy, rpc, world } from './world'
 
 type Blocks = { blocks: readonly { name: string; text: string }[] }
 const block = async ($: { prompt: { context: (e: Blocks) => Promise<Blocks> } }) =>
@@ -25,6 +25,26 @@ describe('brief', () => {
     expect(w.calls[0]?.headers.authorization).toBe('Bearer tok')
     expect(w.statuses).toEqual(['Hark V-012 · Open · 2 need you'])
     expect(w.commands).toEqual(['hark'])
+  })
+
+  test('names the mod on every request: User-Agent, X-Hark-Client and params._meta.client', async ($, on) => {
+    mock.env(on, { HARK_TOKEN: 'tok' })
+    mock.clock(on)
+    const w = world(on, { hark: healthy, answer: () => 'Allow' })
+
+    await $.session.start(SESSION)
+    await block($)
+    await $.tool.call(EDIT('src/db/users.ts'))
+    await $.command.run(COMMAND('needs'))
+    await $.session.end(END())
+
+    expect(w.tools()).toEqual(['get_agent_brief', 'list_journal_entries', 'list_candidates', 'end_session'])
+    for (const c of w.calls) {
+      expect(c.headers['user-agent'], c.tool).toBe(`hark-mod/${MANIFEST.version} (claude-code/${RUNTIME})`)
+      expect(c.headers['x-hark-client'], c.tool).toBe('claude-code-mod')
+      expect(JSON.parse(c.body).params._meta, c.tool).toEqual({ client: 'claude-code-mod' })
+    }
+    expect(w.reads.filter(p => p.endsWith('/.claude-plugin/plugin.json'))).toHaveLength(1)
   })
 
   test('falls back to the keychain when HARK_TOKEN is unset', async ($, on) => {
