@@ -46,6 +46,7 @@ export const DECISIONS = {
     { id: 'd5', kind: 'decision', title: 'Stripe is the only processor', body: 'One reconciliation path.\nscope: billing', rationale: null, acceptance: 'accepted' },
     { id: 'd6', kind: 'decision', title: 'Infra via Terraform (scope: deploy/**)', rationale: 'Reviewable infra', acceptance: 'accepted', scope_area: ['infra'], scope_audience: 'internal' },
     { id: 'd7', kind: 'decision', title: 'Old queue (scope: src/**)', rationale: 'Replaced', acceptance: 'accepted', applicability: 'superseded' },
+    { id: 'd8', kind: 'decision', title: 'Add a waitlist when a lesson is full', rationale: null, acceptance: 'accepted', scope_area: ['Booking'] },
   ],
 }
 

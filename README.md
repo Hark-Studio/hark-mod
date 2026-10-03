@@ -18,7 +18,7 @@ From the Claude plugin directory (the listing is pending; this line will work on
 /plugin install hark@claude-plugins-official
 ```
 
-From this repository, in a Claude Code session:
+From this repository, [github.com/Hark-Studio/hark-mod](https://github.com/Hark-Studio/hark-mod), in a Claude Code session:
 
 ```
 /plugin marketplace add Hark-Studio/hark-mod
@@ -62,17 +62,23 @@ Without a project file the plugin stays idle and sends nothing.
 
 ## The edit guard
 
-Before an `Edit`, `Write` or `NotebookEdit` of a file inside the project, the plugin checks the file's path and the changed text against Hark records that carry a scope. It runs these checks locally, and nothing about the edit is sent to Hark.
+Before an `Edit`, `Write` or `NotebookEdit` of a file inside the project, the plugin checks the file's path against Hark records that carry a scope. It runs these checks locally, and nothing about the edit is sent to Hark. The changed text is never matched.
 
 - **Decisions** come from the project's decision log, fetched on the first edit and again after each compaction. If the fetch fails, the guard uses non-goals alone and tries again a minute later.
 - **Only settled records count.** Proposals waiting for a person (`status: candidate`, `acceptance: proposed`), rejected records, and superseded or retired records are skipped.
 - **Non-goals** come from the brief.
-- **Scope** is read from Hark's structured scope field, `scope_area`, when a record has one. A record without it can carry its scope in its text:
-  - a `(scope: …)` marker in the title, for example `Raw SQL, no ORM (scope: src/db/**)`;
-  - a `scope:` line in the body, for example `scope: billing, src/payments/**`.
+- **Scope** comes from Hark's structured fields when a record has them:
+  - **paths**: `scope.paths` (also `scope_paths`, `paths`, `files`). These are globs such as `src/db/**` or `*.sql`.
+  - **areas**: `scope_area` (also `scope.areas`, `areas`, `area`). These are words such as `billing`.
 
-  When a record has both, the structured field wins. The plugin also accepts `scope_paths`, `scope`, `paths`, `files`, `areas`, `area` and `applies_to` fields. It never treats `scope_version` or `scope_audience` as a file or area scope.
-- A scope with `/`, `*`, `?` or `.` is a path glob (`src/db/**`, `*.sql`). A bare word of three letters or more (`billing`) is an area, matched as a whole word in the path or the changed text.
+  A record without them can carry its scope in its text, where a value with `/`, `*`, `?` or `.` is a path and a bare word is an area:
+  - a `(scope: …)` marker in the title, for example `Raw SQL, no ORM (scope: src/db/**)`;
+  - a `scope:` line in the body, for example `scope: billing`.
+
+  The structured fields win over the text. `scope_version` and `scope_audience` are never treated as a file or area scope.
+- **Matching:**
+  - A record with paths matches only files those globs cover; its areas then map to those paths.
+  - A record with areas but no paths matches the files under a directory named after the area. For example, `billing` covers `src/billing/deposit.ts`, but not `lib/billing.ts` and not a comment that mentions billing. Case is ignored.
 - Records without a scope never trigger the guard.
 
 When an edit matches, Claude Code asks once, in its own question dialog. The question lists every matching record's title and why.
@@ -195,6 +201,7 @@ The tests in [tests/](tests/) run against Claude Code's own hook engine with an 
 
 ### 0.2.0 (2026-10-03)
 
+- The edit guard matches areas by directory, never by the changed text: `billing` covers files under a `billing/` folder, or under the record's `scope.paths` when it has any. A comment that merely mentions "booking" no longer asks about booking decisions.
 - Background sessions and `--resume`: hark finds each conversation by a stable local key and shares its state between processes through `~/.claude/hark/<key>.json`. A conversation moved to a background process keeps its brief, its edits and your Allow answers, and its work is handed off at most once.
 - Every request carries `params._meta.conversation`, a random id per conversation, so Hark can reuse the conversation's open session.
 - Repeated test runs are each counted in the handoff.

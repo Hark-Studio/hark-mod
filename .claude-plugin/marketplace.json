@@ -1,12 +1,18 @@
 {
   "name": "hark",
-  "owner": { "name": "Hark Studio", "email": "hello@harkstudio.io", "url": "https://harkstudio.io" },
+  "owner": {
+    "name": "Hark Studio",
+    "email": "hello@harkstudio.io",
+    "url": "https://harkstudio.io"
+  },
   "description": "Hark — shared project memory for Claude Code",
   "plugins": [
     {
       "name": "hark",
       "source": "./",
-      "description": "Brings your Hark project brief into every session, keeps the plan through compaction, checks edits against accepted decisions, and writes the handoff when you stop."
+      "description": "Brings your Hark project brief into every session, keeps the plan through compaction, checks edits against accepted decisions, and writes the handoff when you stop.",
+      "homepage": "https://github.com/Hark-Studio/hark-mod",
+      "repository": "https://github.com/Hark-Studio/hark-mod"
     }
   ]
 }

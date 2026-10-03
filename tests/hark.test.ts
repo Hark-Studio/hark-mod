@@ -248,8 +248,8 @@ describe('edit guard', () => {
 
     await $.session.start(SESSION)
     await $.tool.call(EDIT('src/app.ts'))
-    await $.tool.call(EDIT('lib/pay.ts', 'rebilling()'))
     await $.tool.call(EDIT('lib/pay.ts', 'charge(billing)'))
+    await $.tool.call(EDIT('src/billing/pay.ts'))
     await $.tool.call({ tool: 'Write', file_path: '/work/src/wallet/keys.ts', content: 'k' })
 
     expect(w.asks.map(a => a.question.split('\n')[0])).toEqual([
@@ -277,12 +277,42 @@ describe('edit guard', () => {
     const w = world(on, { hark: healthy, answer: () => 'Allow' })
 
     await $.session.start(SESSION)
-    await $.tool.call(EDIT('src/db/billing.ts'))
+    await $.tool.call(EDIT('src/db/billing/charges.ts'))
     await $.tool.call(EDIT('src/db/x.ts', 'billing'))
 
     expect(w.asks).toHaveLength(1)
     expect(w.asks[0]?.question).toContain('Decision "Raw SQL, no ORM" covers this edit.')
     expect(w.asks[0]?.question).toContain('Decision "Stripe is the only processor" covers this edit.')
+  })
+
+  test('an area covers files under a directory of that name, never the changed text (the "booking" false positive)', async ($, on) => {
+    mock.env(on, { HARK_TOKEN: 'tok' })
+    mock.clock(on)
+    const w = world(on, { hark: healthy, answer: () => 'Stop' }) // Stop, so every matching edit asks again
+    const first = (q: { question: string }) => q.question.split('\n\n').filter(l => l.includes('covers this edit')).map(l => l.split(' covers')[0])
+
+    await $.session.start(SESSION)
+    await $.tool.call({ tool: 'Edit', file_path: '/work/src/billing/deposit.ts', old_string: 'when a surf lesson is booked', new_string: 'at booking' })
+    await $.tool.call(EDIT('lib/booking.ts')) // a file named after the area is not under its directory
+    await $.tool.call(EDIT('docs/notes.md', 'booking and billing'))
+    await $.tool.call(EDIT('src/Booking/slots.ts'))
+
+    expect(w.asks.map(first)).toEqual([['Decision "Stripe is the only processor"'], ['Decision "Add a waitlist when a lesson is full"']])
+  })
+
+  test("Hark's scope.paths decide alone: areas then map to those paths", async ($, on) => {
+    mock.env(on, { HARK_TOKEN: 'tok' })
+    mock.clock(on)
+    const entries = [
+      { id: 'p1', title: 'Payments live in one place', rationale: 'One audit trail', acceptance: 'accepted', scope: { areas: ['billing'], paths: ['payments/**'] } },
+      { id: 'p2', title: 'Infra is Terraform only', rationale: 'Reviewable', acceptance: 'accepted', scope_area: ['ops'], scope_paths: ['infra/*.tf'] },
+    ]
+    const w = world(on, { hark: tool => (tool === 'list_journal_entries' ? { result: { entries } } : healthy(tool)), answer: () => 'Stop' })
+
+    await $.session.start(SESSION)
+    for (const file of ['src/billing/a.ts', 'payments/a.ts', 'ops/run.sh', 'infra/main.tf', 'infra/vars.json']) await $.tool.call(EDIT(file))
+
+    expect(w.asks.map(a => a.question.split('\n\n').at(-2))).toEqual(['Edit payments/a.ts (-1 +1 lines)', 'Edit infra/main.tf (-1 +1 lines)'])
   })
 
   test('a dismissed question lets the edit through and says so', async ($, on) => {
@@ -316,12 +346,12 @@ describe('edit guard', () => {
     const w = world(on, { hark: healthy, answer: () => 'Allow' })
 
     await $.session.start(SESSION)
-    await $.tool.call({ tool: 'NotebookEdit', notebook_path: '/work/nb/pay.ipynb', new_source: 'billing\nmore' })
+    await $.tool.call({ tool: 'NotebookEdit', notebook_path: '/work/billing/pay.ipynb', new_source: 'charges\nmore' })
     await $.tool.call({ tool: 'Edit', file_path: '/Users/me/other/src/db/x.ts', old_string: 'a', new_string: 'b' })
     await $.session.end(END())
 
-    expect(w.asks.map(a => a.question.split('\n\n')[1])).toEqual(['NotebookEdit nb/pay.ipynb (-0 +2 lines)'])
-    expect(w.calls.find(c => c.tool === 'end_session')?.args.what_changed).toBe('edited nb/pay.ipynb')
+    expect(w.asks.map(a => a.question.split('\n\n')[1])).toEqual(['NotebookEdit billing/pay.ipynb (-0 +2 lines)'])
+    expect(w.calls.find(c => c.tool === 'end_session')?.args.what_changed).toBe('edited billing/pay.ipynb')
     expect(w.sent()).not.toContain('/Users/me')
   })
 

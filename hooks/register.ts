@@ -18,7 +18,7 @@ const INTRO = 'Hark project brief, read at session start. The hark plugin record
 const STATE_FRESH_MS = 30 * 60_000 // another process reuses the conversation's brief while its state is younger than this
 const LOCK_STALE_MS = 30_000 // a handoff lock older than any handoff takes was left by a process that died mid-handoff
 
-type Rule = { id: string; title: string; why: string; scope: string[] }
+type Rule = { id: string; title: string; why: string; paths: string[]; areas: string[] }
 // One conversation's state, kept in ~/.claude/hark/<conversation>.json so that every process carrying the conversation
 // (Claude Code moves one into a background process; --resume starts another) shares it. A segment is the work between handoffs.
 // `id` is random, sent to Hark as params._meta.conversation; the file name is a local hash Hark never sees.
@@ -258,7 +258,7 @@ async function guard($: EngineInterface, s: Hark, tool: string, rel: string, x: 
   const edits = a(x.edits).map(o)
   const added = [x.new_string, x.content, x.new_source, ...edits.map(d => d.new_string)].filter(t => typeof t === 'string').join('\n')
   const removed = [x.old_string, ...edits.map(d => d.old_string)].filter(t => typeof t === 'string').join('\n')
-  const hits = (await (s.rules ??= rules($, s))).filter(r => !s.c.allowed.includes(r.id) && matches(r, rel, `${removed}\n${added}`))
+  const hits = (await (s.rules ??= rules($, s))).filter(r => !s.c.allowed.includes(r.id) && matches(r, rel))
   if (!hits.length) return null
   const count = (t: string) => (t ? t.split('\n').length : 0)
   const summary = `${tool} ${rel} (-${count(removed)} +${count(added)} lines)`
@@ -284,32 +284,46 @@ async function rules($: EngineInterface, s: Hark): Promise<Rule[]> {
   return nonGoals
 }
 
-// A settled record's scope: Hark's structured field when it has one, else a "(scope: src/db/**, billing)" title marker or a "scope: ..." body line.
+// A settled record's scope, as path globs and areas. Hark's structured fields win; without them, the text convention:
+// a "(scope: src/db/**, billing)" title marker or a "scope: ..." body line.
 function asRule(kind: string, v: unknown): Rule[] {
-  const x = o(v), name = typeof v === 'string' ? v : x.title
-  const fields = [x.scope_area, x.scope_paths, x.scope, x.scopes, x.paths, x.files, x.areas, x.area, x.applies_to]
-    .flatMap(y => (y && typeof y === 'object' && !Array.isArray(y) ? Object.values(y).flat() : a(y)))
-  const line = /^\s*(?:scope|areas?|paths?|files?)\s*:\s*(.+)$/im.exec(`${x.body ?? ''}\n${x.rationale ?? ''}`)?.[1]
-  const titled = /\b(?:scope|areas?|paths?|files?)\s*:\s*([^)\]\n]+)/i.exec(String(name ?? ''))?.[1]
-  const marked = [titled, line].flatMap(m => m?.split(/[,\s]+/) ?? [])
-  const scope = (fields.length ? fields : marked).filter((p): p is string => typeof p === 'string').map(p => p.trim())
-    .filter(p => p.length > 2 && !/^(?:and|the|for|all|any|not)$/i.test(p))
+  const x = o(v), name = typeof v === 'string' ? v : x.title, scope = o(x.scope)
+  const isPath = (p: string) => /[/*?.]/.test(p)
+  const loose = scopeWords(Array.isArray(x.scope) || typeof x.scope === 'string' ? x.scope : null, x.scopes, x.applies_to)
+  let paths = [...scopeWords(scope.paths, x.scope_paths, x.paths, x.files), ...loose.filter(isPath)]
+  let areas = [...scopeWords(x.scope_area, scope.areas, scope.area, x.areas, x.area), ...loose.filter(p => !isPath(p))]
+  if (!paths.length && !areas.length) {
+    const line = /^\s*(?:scope|areas?|paths?|files?)\s*:\s*(.+)$/im.exec(`${x.body ?? ''}\n${x.rationale ?? ''}`)?.[1]
+    const titled = /\b(?:scope|areas?|paths?|files?)\s*:\s*([^)\]\n]+)/i.exec(String(name ?? ''))?.[1]
+    const marked = scopeWords(...[titled, line].flatMap(m => m?.split(/[,\s]+/) ?? []))
+    paths = marked.filter(isPath)
+    areas = marked.filter(p => !isPath(p))
+  }
   const unsettled = /propos|candidate|reject|supersed|draft|pending|retir|expir|obsolete/i.test(`${x.status ?? ''} ${x.acceptance ?? ''} ${x.applicability ?? ''}`)
-  if (!scope.length || unsettled || x.superseded_by || x.accepted === false) return []
+  if ((!paths.length && !areas.length) || unsettled || x.superseded_by || x.accepted === false) return []
   const title = String(name ?? x.summary ?? 'Untitled').replace(/\s*[([]?\b(?:scope|areas?|paths?|files?)\s*:.*$/i, '')
   const why = String(x.why ?? x.rationale ?? x.body ?? '').replace(/^\s*(?:scope|areas?|paths?|files?)\s*:.*$/gim, '').trim().slice(0, 300)
-  return [{ id: String(x.id ?? `${kind}:${title}`), title: `${kind} "${title}"`, why: why || 'No rationale recorded.', scope }]
+  return [{ id: String(x.id ?? `${kind}:${title}`), title: `${kind} "${title}"`, why: why || 'No rationale recorded.', paths, areas }]
 }
 
-// A scope with / * ? or . is a path glob; a bare word is an area, matched as a whole word in the path or the diff.
-function matches(rule: Rule, path: string, diff: string): boolean {
-  return rule.scope.some(p => {
-    const word = p.replace(/[^\w-]/g, '')
-    if (!/[/*?.]/.test(p)) return word !== '' && new RegExp(`\\b${word}\\b`, 'i').test(`${path}\n${diff}`)
-    const glob = p.replace(/^\.?\//, '').replace(/\/$/, '').replace(/[.+^${}()|[\]\\]/g, '\\$&')
-      .replace(/\*\*\/?/g, '\0').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]').replace(/\0/g, '.*')
-    return new RegExp(`(^|/)${glob}($|/)`).test(path)
-  })
+// The scope strings among some fields' values, without filler words a marker may hold ("billing and booking").
+function scopeWords(...values: unknown[]): string[] {
+  return values.flatMap(a).filter((p): p is string => typeof p === 'string').map(p => p.trim())
+    .filter(p => p.length > 2 && !/^(?:and|the|for|all|any|not)$/i.test(p))
+}
+
+// Explicit paths are globs, and a record that has them is matched on them alone. An area (billing, booking) covers the
+// files under a directory of that name. The changed text never counts.
+function matches(rule: Rule, path: string): boolean {
+  if (rule.paths.length) {
+    return rule.paths.some(p => {
+      const glob = p.replace(/^\.?\//, '').replace(/\/$/, '').replace(/[.+^${}()|[\]\\]/g, '\\$&')
+        .replace(/\*\*\/?/g, '\0').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]').replace(/\0/g, '.*')
+      return new RegExp(`(^|/)${glob}($|/)`).test(path)
+    })
+  }
+  const dirs = path.toLowerCase().split('/').slice(0, -1)
+  return rule.areas.some(area => dirs.includes(area.toLowerCase()))
 }
 
 // end_session for the conversation's work since the last handoff, sent once, by whichever process ends it first;
