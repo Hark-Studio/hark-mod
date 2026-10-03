@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="512" height="512" role="img" aria-label="Hark mark: nine seats around an oval table">
+  <!-- The Harkness table, implied by its seats. Head seat (bottom) in blueprint blue. -->
+  <circle cx="32"    cy="46"    r="4.4" fill="#005798"/>
+  <circle cx="17.86" cy="42.72" r="3.3" fill="#002f56"/>
+  <circle cx="10.33" cy="34.43" r="3.3" fill="#002f56"/>
+  <circle cx="12.95" cy="25"    r="3.3" fill="#002f56"/>
+  <circle cx="24.47" cy="18.85" r="3.3" fill="#002f56"/>
+  <circle cx="39.53" cy="18.85" r="3.3" fill="#002f56"/>
+  <circle cx="51.05" cy="25"    r="3.3" fill="#002f56"/>
+  <circle cx="53.67" cy="34.43" r="3.3" fill="#002f56"/>
+  <circle cx="46.14" cy="42.72" r="3.3" fill="#002f56"/>
+</svg>
