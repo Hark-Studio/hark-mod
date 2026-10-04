@@ -13,7 +13,7 @@ export async function keyOf(root = ROOT, started = STARTED): Promise<string> {
   return [...new Uint8Array(digest).slice(0, 16)].map(b => b.toString(16).padStart(2, '0')).join('')
 }
 // The plugin's own manifest as the host returns it (the test environment has no file system).
-export const MANIFEST = { name: 'hark-memory', version: '0.2.2' }
+export const MANIFEST = { name: 'hark-memory', version: '0.2.3' }
 
 // The compact brief, shaped like a real get_agent_brief reply.
 export const BRIEF = {

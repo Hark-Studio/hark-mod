@@ -161,7 +161,7 @@ The plugin makes no network request except these. Each one is an HTTPS `POST` to
 
 | URL | Tool | When | Fields sent |
 | --- | --- | --- | --- |
-| `https://harkstudio.io/mcp` | *every request below* | Always | **Headers:** `Content-Type: application/json`, `Accept: application/json, text/event-stream`, `Authorization: Bearer <your access key>`, `User-Agent: hark-mod/<version> (claude-code/<version>)` (for example `hark-mod/0.2.2 (claude-code/2.1.289)`), `X-Hark-Client: claude-code-mod`. **Body:** `jsonrpc`, `id`, `method: "tools/call"`, and `params` with the tool's `name`, its `arguments` (below), and `_meta: { client: "claude-code-mod", conversation: "<conversation id>" }`. The conversation id is 32 random hex characters, the same in every process of one conversation; it reveals nothing about your machine |
+| `https://harkstudio.io/mcp` | *every request below* | Always | **Headers:** `Content-Type: application/json`, `Accept: application/json, text/event-stream`, `Authorization: Bearer <your access key>`, `User-Agent: hark-mod/<version> (claude-code/<version>)` (for example `hark-mod/0.2.3 (claude-code/2.1.289)`), `X-Hark-Client: claude-code-mod`. **Body:** `jsonrpc`, `id`, `method: "tools/call"`, and `params` with the tool's `name`, its `arguments` (below), and `_meta: { client: "claude-code-mod", conversation: "<conversation id>" }`. The conversation id is 32 random hex characters, the same in every process of one conversation; it reveals nothing about your machine |
 | `https://harkstudio.io/mcp` | `get_agent_brief` | Session start, unless another process of this conversation fetched a brief and saved its state in the last 30 minutes and the project's cached brief is at least that new (the agent view's empty placeholder waits for its first message); at each compaction, as it starts, even if another hook then skips it; `/hark brief`; the first message after `/clear`, or after a resume under the same rule as session start | `venture` (project code), `depth: "compact"` |
 | `https://harkstudio.io/mcp` | `list_journal_entries` | The first guarded edit of a session, and the first after each compaction; a minute after a failed attempt | `venture`, `kind: "decision"`, `limit: 200` |
 | `https://harkstudio.io/mcp` | `list_candidates` | `/hark needs` | `venture` |
@@ -291,6 +291,10 @@ The tests in [tests/](tests/) run against Claude Code's own hook engine with an 
 - the privacy rules: no edit text, code or credentials leave the machine, the key is taken from the plugin's options only, no program starts and no file is written, and without a key nothing is sent or stored.
 
 ## Changelog
+
+### 0.2.3 (2026-10-04)
+
+- `plugin.json` links Hark's terms of service (`termsOfServiceUrl`: https://harkstudio.io/terms) for the directory listing.
 
 ### 0.2.2 (2026-10-03)
 
