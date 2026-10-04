@@ -5,7 +5,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const CLIENT = 'claude-code-mod' // X-Hark-Client header and params._meta.client on every request
-const CONFIGURE = '/plugin configure hark-memory@hark (hark-memory@claude-plugins-official for a directory install)'
+const CONFIGURE = '/plugin configure hark-memory@hark (hark-memory@synced if you added it from the Claude directory)'
 const CODE = /\b(V-\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i
 const TESTS = /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test|(?:go|cargo|deno|mix|dotnet|swift|make)\s+test|python3?\s+-m\s+(?:pytest|unittest)|pytest|vitest|jest|mocha|rspec|phpunit|tox|claude\s+plugin\s+test)\b/
 const NEXT = /^\W*(?:#+\s*)?(?:\*\*)?next (?:steps?|up)\b[^\w\n]*/i
@@ -16,24 +16,27 @@ const SECRET = new RegExp([/-----BEGIN[^\n]*PRIVATE KEY-----[\s\S]*?(?:-----END[
 ].map(r => r.source).join('|'), 'gi')
 const INTRO = 'Hark project brief, read at session start. The hark plugin records the handoff (end_session) when this session ends, so you need not call it.'
 const STATE_FRESH_MS = 30 * 60_000 // another process reuses the conversation's brief while its state is younger than this
-const LOCK_STALE_MS = 30_000 // a handoff lock older than any handoff takes was left by a process that died mid-handoff
+const LOCK_STALE_MS = 30_000 // a handoff claim older than any handoff takes was left by a process that died mid-handoff
+const KEEP_MS = 14 * 24 * 60 * 60_000 // conversation records and cached briefs are dropped from the store after this
+const EXIT_WRITE_MS = 150 // longest a store write may hold up a handoff: Claude Code waits up to ~0.7 s for the store's lock
 
 type Rule = { id: string; title: string; why: string; paths: string[]; areas: string[] }
-// One conversation's state, kept in ~/.claude/hark/<conversation>.json so that every process carrying the conversation
-// (Claude Code moves one into a background process; --resume starts another) shares it. A segment is the work between handoffs.
-// `id` is random, sent to Hark as params._meta.conversation; the file name is a local hash Hark never sees.
+// One conversation's state, kept in the plugin's own store ($.store, which Claude Code saves) so that every process carrying the
+// conversation (Claude Code moves one into a background process; --resume starts another) shares it. Each process writes only its
+// own record, "c:<conversation key>:<start>:<random>", and reads merge them all. A segment is the work between handoffs.
+// `id` is random, sent to Hark as params._meta.conversation; the conversation key is a local hash Hark never sees.
 type Conversation = {
-  id: string; latest: string; segment: number; closed: boolean; opened: boolean; updatedAt: number; brief: unknown; briefAt: number
+  id: string; latest: string; segment: number; closed: boolean; opened: boolean; updatedAt: number; briefAt: number
   recap: boolean; handoff: 'Open' | 'Draft' | 'Clean'; needs: number; notes: string
   files: string[]; commits: string[]; tests: string[]; links: string[]; allowed: string[]; sessions: string[]
 }
 type Hark = { ready: Promise<boolean> | null; root: string; code: string; token: string; agent: string; rpc: number; uuid: string
-  home: string; key: string; shared: boolean; session: string; moved: boolean; prompted: boolean
+  key: string; record: string; shared: boolean; saving: Promise<void>; session: string; moved: boolean; prompted: boolean
   brief: Promise<unknown> | null; rules: Promise<Rule[]> | null; retry: number; c: Conversation; logged: Set<string> }
 const LISTS = ['files', 'commits', 'tests', 'links', 'allowed', 'sessions'] as const
-const conversation = (): Conversation => ({ id: '', latest: '', segment: 0, closed: false, opened: false, updatedAt: 0, brief: null,
+const conversation = (): Conversation => ({ id: '', latest: '', segment: 0, closed: false, opened: false, updatedAt: 0,
   briefAt: 0, recap: false, handoff: 'Open', needs: 0, notes: '', files: [], commits: [], tests: [], links: [], allowed: [], sessions: [] })
-const fresh = (): Hark => ({ ready: null, root: '', code: '', token: '', agent: '', rpc: 0, uuid: '', home: '', key: '', shared: false, session: '',
+const fresh = (): Hark => ({ ready: null, root: '', code: '', token: '', agent: '', rpc: 0, uuid: '', key: '', record: '', shared: false, saving: Promise.resolve(), session: '',
   moved: false, prompted: false, brief: null, rules: null, retry: 0, c: conversation(), logged: new Set() })
 const hex = (bytes: Uint8Array) => [...bytes].map(b => b.toString(16).padStart(2, '0')).join('')
 const add = (list: string[], value: string) => { if (!list.includes(value)) list.push(value) }
@@ -77,9 +80,11 @@ export const register: Register = (on, options) => {
   })
 
   // The agent view's empty placeholder session makes no Hark call until someone gives it a task.
+  // The process that got the latest prompt is the one carrying the conversation (see session.end).
   on('prompt.submit', async ($, e, next) => {
     if (!s.prompted && (await placeholder($))) $.ui.invalidate('prompt.context')
     s.prompted = true
+    if (s.ready && (await s.ready)) await soon($, save($, s, c => { c.latest = s.session }))
     return next(e)
   })
 
@@ -151,7 +156,7 @@ export const register: Register = (on, options) => {
   })
 
   // 4. Hand off when the session ends (exit, /clear, resume, logout, signal), unless the conversation moved on:
-  // the process carrying it now hands off instead, with this one's work from the shared state file.
+  // the process carrying it now hands off instead, with this one's work from the shared store.
   on('session.end', async ($, e, next) => {
     if ((await s.ready) && !(s.moved && s.shared)) await handoff($, s, () => next.budget.remainingMs)
     if (e.reason === 'clear' || e.reason === 'resume') s = fresh() // a new conversation: its own key, state and brief
@@ -179,26 +184,25 @@ async function boot($: EngineInterface, s: Hark, accessKey: string): Promise<boo
     const manifest = o(parse(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`).catch(() => ''), null))
     const runtime = await $.session.version().then(v => v.version, () => 'unknown')
     s.agent = `hark-mod/${manifest.version ?? 'unknown'} (claude-code/${runtime})`
-    // The state file, ~/.claude/hark/<key>.json, has the same name in every process that carries this conversation: a hash
-    // of the session root and the conversation's first launch, which a background move and --resume keep and /clear starts over.
+    // The conversation key is the same in every process that carries this conversation: a hash of the session root and the
+    // conversation's first launch, which a background move and --resume keep and /clear starts over.
     s.session = await $.session.id().catch(() => '')
     const started = await $.session.usage().then(u => `${s.root}#${u.startedAt}`, () => s.session)
     s.key = hex(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(started))).slice(0, 16))
-    s.home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE')) || ''
-    if (s.home) {
-      // the folder is readable by this user alone, where the host can set that
-      await $.process.run(['mkdir', '-p', '-m', '700', `${s.home}/.claude/hark`], { timeoutMs: 1000 }).catch(() => null)
-      await $.process.run(['chmod', '700', `${s.home}/.claude/hark`], { timeoutMs: 1000 }).catch(() => null)
-    }
+    const now = await $.clock.now()
+    s.record = `c:${s.key}:${now.toString(36)}:${hex(crypto.getRandomValues(new Uint8Array(4)))}`
     await save($, s) // what other processes of this conversation left
-    const recent = s.c.brief != null && (await $.clock.now()) - s.c.updatedAt < STATE_FRESH_MS
+    const cached = o(await $.store.get(`brief:${s.code}`).catch(() => null))
+    // another process of this conversation fetched a brief and saved lately, and the project's cache is at least that new
+    const recent = cached.brief != null && s.c.briefAt > 0 && Number(cached.at) >= s.c.briefAt && now - s.c.updatedAt < STATE_FRESH_MS
     await save($, s, c => {
       c.id ||= hex(crypto.getRandomValues(new Uint8Array(16)))
       c.latest = s.session
       if (s.session) add(c.sessions, s.session)
     })
+    await prune($, s, now)
     if (recent) show($, s)
-    s.brief = recent ? Promise.resolve(s.c.brief) : brief($, s) // reuse what another process of this conversation fetched
+    s.brief = recent ? Promise.resolve(cached.brief) : brief($, s) // reuse the brief another process of this conversation fetched
     return true
   } catch (err) { return note($, s, `setup failed (${errText(err)})`), false }
 }
@@ -244,7 +248,8 @@ async function brief($: EngineInterface, s: Hark): Promise<unknown> {
   const h = o(o(b).handoff), pending = o(b).open_candidates, now = await $.clock.now()
   const state = h.draft ? 'Draft' : /clean|closed|ended|confirmed/i.test(String(h.status ?? '')) ? 'Clean' : 'Open'
   const needs = typeof pending === 'number' ? pending : a(o(o(b).unreviewed).items).length
-  await save($, s, c => Object.assign(c, { brief: b, briefAt: now, opened: true, handoff: state, needs }))
+  await $.store.set(`brief:${s.code}`, { at: now, brief: b }).catch(() => undefined) // one cached brief per project, not per conversation
+  await save($, s, c => Object.assign(c, { briefAt: now, opened: true, handoff: state, needs }))
   show($, s)
   return b
 }
@@ -347,7 +352,7 @@ async function handoff($: EngineInterface, s: Hark, left: () => number): Promise
   if (!(await claim($, s))) return 'Another Claude Code process is handing this conversation off.'
   // Close the segment before sending: work recorded while end_session is in flight opens the next one.
   const segment = s.c.segment
-  await save($, s, c => { if (c.segment === segment) c.closed = true })
+  await soon($, save($, s, c => { if (c.segment === segment) c.closed = true }))
   const work = { ...s.c }
   const ended = await attempt($, s, 'end_session failed', 'end_session', handoffArgs(s, work), ms())
   let result = `Handoff saved to Hark (${s.code}).`, state: Conversation['handoff'] = 'Clean'
@@ -359,41 +364,75 @@ async function handoff($: EngineInterface, s: Hark, left: () => number): Promise
       : stopped instanceof Error ? `Hark is unreachable; no handoff was recorded (${stopped.message}).`
       : 'Hark could not take the handoff, so it will draft one from repo activity.'
   }
-  await save($, s, c => Object.assign(c, { opened: false, handoff: state })) // attempted once; Hark's idle sweep covers a miss
+  await soon($, save($, s, c => Object.assign(c, { opened: false, handoff: state }))) // attempted once; Hark's idle sweep covers a miss
   show($, s)
   return result
 }
 
-// mkdir is atomic: when two processes end the same conversation at once, only one gets to hand off its segment.
+// When two processes end the same conversation at once, only one hands its segment off: each stores a claim, and the first
+// claim the store holds wins, since $.store keeps keys in the order they were first set. A claim older than LOCK_STALE_MS was
+// left by a process that died mid-handoff and no longer counts. When the store refuses the claim, the closed flag decides.
 async function claim($: EngineInterface, s: Hark): Promise<boolean> {
-  if (!s.home) return true
-  const made = await $.process.run(['mkdir', `${s.home}/.claude/hark/${s.key}.${s.c.segment}.lock`], { timeoutMs: 250 }).catch(() => null)
-  if (made === null || made.exitCode === 0) return true // no process API here (or the lock is ours): the closed flag decides
-  const held = await $.fs.stat(`${s.home}/.claude/hark/${s.key}.${s.c.segment}.lock`).then(st => st.mtimeMs, () => 0)
-  return (await $.clock.now()) - held > LOCK_STALE_MS
+  const now = await $.clock.now(), prefix = `handoff:${s.key}:${s.c.segment}:`
+  const mine = `${prefix}${now.toString(36)}:${crypto.randomUUID()}`
+  await soon($, $.store.set(mine, true)) // a claim still waiting on the store's lock counts as refused
+  for (const k of (await $.store.keys().catch(() => [] as string[])).filter(k => k.startsWith(prefix))) {
+    if (k === mine) return true
+    if (now - parseInt(k.split(':')[3] ?? '', 36) < LOCK_STALE_MS) return false // an earlier, live claim
+  }
+  return true
+}
+
+// Keeps the store small (Claude Code caps it at 4 MiB). Drops records not saved for KEEP_MS, and, once this process has
+// stored its merged record, this conversation's other records idle for STATE_FRESH_MS (a live process stores its state again
+// on its next save); cached briefs older than KEEP_MS; and claims older than an hour. A key's age is in its name, and a key
+// that looks old is read for when it was last saved. At most 20 deletions per start: a long-unused store clears over several.
+async function prune($: EngineInterface, s: Hark, now: number): Promise<void> {
+  let left = 20
+  for (const k of await $.store.keys().catch(() => [] as string[])) {
+    const [kind, conv, third, fourth] = k.split(':')
+    const limit = kind === 'handoff' ? 60 * 60_000 : kind === 'c' && conv === s.key && s.shared ? STATE_FRESH_MS : KEEP_MS
+    let at = kind === 'c' ? parseInt(third ?? '', 36) : kind === 'handoff' ? parseInt(fourth ?? '', 36) : kind === 'brief' ? 0 : NaN
+    if (left === 0 || k === s.record || !(now - at > limit)) continue
+    if (kind !== 'handoff') at = Math.max(at, Number(o(await $.store.get(k).catch(() => null))[kind === 'c' ? 'updatedAt' : 'at']) || 0)
+    if (now - at > limit) left -= await $.store.delete(k).then(() => 1, () => 0)
+  }
+}
+
+// Waits for a store write at most EXIT_WRITE_MS, so a held store lock can't use up the exit window; the write goes on.
+async function soon($: EngineInterface, write: Promise<unknown>): Promise<boolean> {
+  return Promise.race([write.then(() => true, () => false), $.clock.sleep(EXIT_WRITE_MS).then(() => false, () => false)])
 }
 
 // The conversation moved on when its transcript's last continued-in row has no reply from Claude after it.
-// null when the transcript can't be read (no tail command, too big to read whole).
+// null when the transcript can't be read (the host reads files up to 4 MiB).
 async function movedAway($: EngineInterface, transcript: string): Promise<boolean | null> {
   if (!transcript) return null
-  const tailed = await $.process.run(['tail', '-c', '65536', transcript], { timeoutMs: 1000 }).then(r => (r.exitCode === 0 ? r.stdout : null), () => null)
-  const tail = tailed ?? (await $.fs.read(transcript).catch(() => null))?.slice(-65536)
-  if (tail == null) return null
-  const types = tail.split('\n').map(line => String(o(parse(line, null)).type ?? ''))
+  const end = (await $.fs.read(transcript).catch(() => null))?.slice(-65536)
+  if (end == null) return null
+  const types = end.split('\n').map(line => String(o(parse(line, null)).type ?? ''))
   const at = types.lastIndexOf('continued-in')
   return at >= 0 && !types.slice(at + 1).includes('assistant')
 }
 
-// Read-merge-write of the conversation's state file, so the processes sharing a conversation see each other's work.
-async function save($: EngineInterface, s: Hark, change?: (c: Conversation) => void): Promise<void> {
-  if (s.home) s.c = merge(s.c, sane(parse(await $.fs.read(`${s.home}/.claude/hark/${s.key}.json`).catch(() => ''), null)))
+// One save at a time in each process: two at once would merge from the same copy, and the later would drop the other's change.
+function save($: EngineInterface, s: Hark, change?: (c: Conversation) => void): Promise<void> {
+  const run = s.saving.then(() => saveNow($, s, change))
+  s.saving = run.catch(() => undefined)
+  return run
+}
+
+// Merges the records every process of this conversation stored, then stores this process's own. Processes never write the
+// same key, so no write overwrites another's. The oldest record, this process's own included, is merged last, so the first
+// record's conversation id wins in every process.
+async function saveNow($: EngineInterface, s: Hark, change?: (c: Conversation) => void): Promise<void> {
+  const records = (await $.store.keys().catch(() => [] as string[])).filter(k => k.startsWith(`c:${s.key}:`))
+  for (const k of records.reverse()) s.c = merge(s.c, sane(await $.store.get(k).catch(() => null)))
   if (!change) return
   change(s.c)
   s.c.updatedAt = await $.clock.now()
-  if (!s.home) return
   try {
-    await $.fs.write(`${s.home}/.claude/hark/${s.key}.json`, JSON.stringify(s.c)) // the only file hark writes
+    await $.store.set(s.record, s.c)
     s.shared = true
   } catch (err) {
     s.shared = false
@@ -401,21 +440,21 @@ async function save($: EngineInterface, s: Hark, change?: (c: Conversation) => v
   }
 }
 
-// The state file is data from disk: keep only fields of the expected type.
+// A stored record is data from disk: keep only fields of the expected type.
 function sane(v: unknown): Conversation {
   const x = o(v), out: Record<string, unknown> = conversation()
   for (const [k, fallback] of Object.entries(out)) {
-    if (k === 'brief') out[k] = x[k] ?? null
-    else if (Array.isArray(fallback)) out[k] = a(x[k]).filter(t => typeof t === 'string')
+    if (Array.isArray(fallback)) out[k] = a(x[k]).filter(t => typeof t === 'string')
     else if (typeof x[k] === typeof fallback) out[k] = x[k]
   }
   return out as Conversation
 }
 
-// New activity after a handoff starts the conversation's next segment.
+// New activity after a handoff starts the conversation's next segment. The process doing the work carries the conversation.
 async function record($: EngineInterface, s: Hark, change: (c: Conversation) => void): Promise<void> {
   await save($, s, c => {
     if (c.closed) Object.assign(c, { segment: c.segment + 1, closed: false, notes: '', files: [], commits: [], tests: [], links: [] })
+    c.latest = s.session
     change(c)
   })
 }
@@ -471,10 +510,8 @@ async function command($: EngineInterface, s: Hark, sub: string): Promise<string
     const v = await attempt($, s, 'project link unavailable', 'get_venture', { id_or_code: s.code })
     if (!(v instanceof Error)) s.uuid = [o(v).id, o(o(v).venture).id].find(isId) ?? ''
   }
-  const url = s.uuid ? `https://harkstudio.io/ventures/${s.uuid}` : 'https://harkstudio.io/studio'
-  const opened = (await $.process.run(['open', url], { timeoutMs: 5000 }).then(r => r.exitCode === 0, () => false))
-    || (await $.process.run(['xdg-open', url], { timeoutMs: 5000 }).then(r => r.exitCode === 0, () => false))
-  return `${opened ? 'Opened' : 'Open'} [${s.code} on Hark](${url})`
+  // A link to click: hark starts no program, browser included.
+  return `${s.code} on Hark: ${s.uuid ? `https://harkstudio.io/ventures/${s.uuid}` : 'https://harkstudio.io/studio'}`
 }
 
 // The agent view's empty "new session" placeholder: a spare process nobody has given a prompt yet. Counting the

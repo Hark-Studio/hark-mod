@@ -1,21 +1,19 @@
-// An in-memory host for hark's tests: a fake Hark server, file system, processes and UI.
+// An in-memory host for hark's tests: a fake Hark server, file system, plugin store and UI.
 import type { On } from 'claude-code'
 
 export const ENDPOINT = 'https://harkstudio.io/mcp'
 export const ROOT = '/work'
 export const UUID = 'b409db7e-ea4c-4229-8a55-03eab8865d8f'
-export const RUNTIME = '2.1.288'
+export const RUNTIME = '2.1.289'
 export const STARTED = 1791061331000 // the conversation's first launch, as $.session.usage().startedAt reports it
-export const HOME = '/home/me'
 
 /** The conversation key hark derives: the first 16 bytes of SHA-256(root + '#' + startedAt), in hex. */
 export async function keyOf(root = ROOT, started = STARTED): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${root}#${started}`))
   return [...new Uint8Array(digest).slice(0, 16)].map(b => b.toString(16).padStart(2, '0')).join('')
 }
-export const stateFile = (key: string) => `${HOME}/.claude/hark/${key}.json`
 // The plugin's own manifest as the host returns it (the test environment has no file system).
-export const MANIFEST = { name: 'hark-memory', version: '0.2.1' }
+export const MANIFEST = { name: 'hark-memory', version: '0.2.2' }
 
 // The compact brief, shaped like a real get_agent_brief reply.
 export const BRIEF = {
@@ -69,13 +67,17 @@ export function world(
     started?: () => number
     hark?: (tool: string, args: Record<string, unknown>, call: Call) => Reply | undefined | Promise<Reply | undefined>
     turns?: number // prompts sent so far, as $.session.turns() reports them
-    run?: (argv: string[]) => { exitCode: number; stdout?: string } | undefined // overrides one command's outcome
+    store?: Record<string, unknown> // what the plugin's store ($.store) holds at the start, in insertion order. session.start
+    // doesn't wait for hark's boot, so a test that changes the store "from another process" after boot awaits block($) first
+    storeFails?: (op: 'get' | 'set' | 'delete' | 'keys', key?: string) => boolean // refuses a store call, as a held lock or a malformed file does
+    onSet?: (key: string, store: Map<string, unknown>) => void // runs before a set lands, to let "another process" write first
+    hold?: (key: string) => Promise<void> | undefined // keeps a set waiting, as another process holding the store's lock does
     answer?: (question: string) => string | null
     bash?: (command: string) => Bash
   } = {},
 ) {
   const w = {
-    calls: [] as Call[], env: [] as string[], reads: [] as string[], writes: [] as string[], runs: [] as string[][], dirs: new Set<string>(), lockTimes: new Map<string, number>(), statuses: [] as (string | undefined)[], logs: [] as string[],
+    calls: [] as Call[], env: [] as string[], store: new Map<string, unknown>(Object.entries(opts.store ?? {})), reads: [] as string[], writes: [] as string[], runs: [] as string[][], statuses: [] as (string | undefined)[], logs: [] as string[],
     asks: [] as { question: string; header?: string; options: string[] }[], invalidated: [] as string[], commands: [] as string[],
   }
   const tools = () => w.calls.map(c => c.tool)
@@ -94,19 +96,22 @@ export function world(
   on('session.id', () => ({ value: opts.sessionId ?? 'sess-1' }))
   on('session.turns', () => ({ value: opts.turns ?? 0 }))
   on('fs.write', ($, e) => ((files[e.path] = e.text), w.writes.push(e.path), { value: undefined }))
-  on('fs.exists', ($, e) => ({ value: e.path in files || w.dirs.has(e.path) }))
-  on('fs.stat', ($, e) =>
-    w.dirs.has(e.path) ? { value: { kind: 'dir' as const, size: 0, mtimeMs: w.lockTimes.get(e.path) ?? 0, isLink: false } } : { deny: `ENOENT: ${e.path}` })
-  on('process.run', ($, e) => {
-    w.runs.push([...e.argv])
-    const done = (exitCode: number, stdout = '') => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
-    const target = e.argv.at(-1) ?? ''
-    const given = opts.run?.([...e.argv])
-    if (given) return done(given.exitCode, given.stdout)
-    if (e.argv[0] === 'mkdir' && e.argv.includes('-p')) return w.dirs.add(target), done(0)
-    if (e.argv[0] === 'mkdir') return w.dirs.has(target) ? done(1) : (w.dirs.add(target), done(0))
-    if (e.argv[0] === 'tail') return target in files ? done(0, (files[target] ?? '').slice(-Number(e.argv[2]))) : done(1)
-    return done(0)
+  on('fs.exists', ($, e) => ({ value: e.path in files }))
+  on('fs.stat', ($, e) => ({ deny: `ENOENT: ${e.path}` }))
+  // hark starts no program; a test asserts runs stays empty
+  on('process.run', ($, e) => (w.runs.push([...e.argv]), { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  // $.store as Claude Code keeps it: JSON values, keys in the order they were first set.
+  const clone = (v: unknown) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)))
+  const refused = (op: 'get' | 'set' | 'delete' | 'keys', key?: string) => opts.storeFails?.(op, key) ?? false
+  on('store.get', ($, e) => (refused('get', e.key) ? { deny: 'store file is malformed' } : { value: clone(w.store.get(e.key)) }))
+  on('store.keys', () => (refused('keys') ? { deny: 'store file is malformed' } : { value: [...w.store.keys()] }))
+  on('store.delete', ($, e) => (refused('delete', e.key) ? { deny: 'Lock file is already being held' } : (w.store.delete(e.key), { value: undefined })))
+  on('store.set', async ($, e) => {
+    await opts.hold?.(e.key)
+    if (refused('set', e.key)) return { deny: 'Lock file is already being held' }
+    opts.onSet?.(e.key, w.store)
+    w.store.set(e.key, clone(e.value))
+    return { value: undefined }
   })
   on('http.fetch', async ($, e) => {
     const body = e.init?.body ?? '{}'

@@ -1,7 +1,7 @@
 {
   "name": "hark-memory",
   "displayName": "Hark — shared project memory",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Brings your Hark project brief into every session, keeps the plan through compaction, checks edits against accepted decisions, and writes the handoff when you stop.",
   "author": {
     "name": "Hark Studio",

@@ -1,4 +1,4 @@
-# Type declarations Claude Code writes for local development (/plugin-types, hot reload)
+# Type declarations Claude Code writes when it loads the plugin from this folder
 .claude/types/
 .claude-plugin/types/
 .DS_Store

@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { BRIEF, COMMAND, EDIT, END, ENDPOINT, HOME, MANIFEST, MESSAGES, RUNTIME, SESSION, STARTED, TURN, UUID, healthy, keyOf, rpc, stateFile, world } from './world'
+import { BRIEF, COMMAND, EDIT, END, ENDPOINT, MANIFEST, MESSAGES, RUNTIME, SESSION, STARTED, TURN, UUID, healthy, keyOf, rpc, world } from './world'
 
 type Blocks = { blocks: readonly { name: string; text: string }[] }
 const COMMIT = '[main abc1234def] Add the guard\n 1 file changed'
@@ -54,11 +54,13 @@ describe('brief', () => {
       expect(JSON.parse(c.body).params._meta, c.tool).toEqual({ client: 'claude-code-mod', conversation })
     }
     expect(w.reads.filter(p => p.endsWith('/.claude-plugin/plugin.json'))).toHaveLength(1)
+    expect([w.runs, w.writes]).toEqual([[], []]) // no program started, no file written
+    expect(new Set(w.env)).toEqual(new Set(['CLAUDE_BG_SOURCE']))
   })
 
-  test("without an access key it stays idle: no request, command, file or question, one log line, and no HARK_* variable read", async ($, on) => {
+  test('without an access key it stays idle: no request, program, write, stored state or question, and one log line', async ($, on) => {
     mock.clock(on)
-    const w = world(on, { env: { HOME, HARK_TOKEN: 'env-token', HARK_PAT: 'pat' }, hark: healthy, bash })
+    const w = world(on, { hark: healthy, bash })
 
     const first = await $.command.run(COMMAND('brief')) // /hark before session.start
     await $.session.start(SESSION)
@@ -69,10 +71,10 @@ describe('brief', () => {
     await $.command.run(COMMAND('open'))
     await $.session.end(END())
 
-    expect(first.text).toBe('Hark is not set up here: run `hark init` in the project, then set the access key with /plugin configure hark-memory@hark (hark-memory@claude-plugins-official for a directory install).')
-    expect([w.calls, w.runs, w.writes, w.asks, w.statuses]).toEqual([[], [], [], [], []])
-    expect(w.logs).toEqual(['hark: no access key; set it with /plugin configure hark-memory@hark (hark-memory@claude-plugins-official for a directory install)'])
-    expect(w.env.every(name => ['CLAUDE_BG_SOURCE', 'HOME', 'USERPROFILE'].includes(name))).toBe(true)
+    expect(first.text).toBe('Hark is not set up here: run `hark init` in the project, then set the access key with /plugin configure hark-memory@hark (hark-memory@synced if you added it from the Claude directory).')
+    expect([w.calls, w.runs, w.writes, w.asks, w.statuses, [...w.store.keys()]]).toEqual([[], [], [], [], [], []])
+    expect(w.logs).toEqual(['hark: no access key; set it with /plugin configure hark-memory@hark (hark-memory@synced if you added it from the Claude directory)'])
+    expect(new Set(w.env)).toEqual(new Set(['CLAUDE_BG_SOURCE'])) // the only variable hark reads
   })
 
   test('trims the access key, and /hark works before session.start', { options: { access_key: '  tok \n' } }, async ($, on) => {
@@ -404,7 +406,7 @@ describe('handoff', () => {
   test('agent notes and commit subjects lose credentials, open or tilde code fences and the access key, on the wire and on disk', { options: { access_key: 'tok-9f8e7d6c5b4a' } }, async ($, on) => {
     mock.clock(on)
     const rotate = { result: { stdout: '[main abc1234] Rotate tok-9f8e7d6c5b4a out\n', stderr: '', interrupted: false, gitOperation: { commit: { sha: 'abc1234', kind: 'committed' } } } }
-    const w = world(on, { env: { HOME }, hark: healthy, bash: () => rotate })
+    const w = world(on, { hark: healthy, bash: () => rotate })
     const notes = [
       'Wired Stripe: set STRIPE_SECRET_KEY=sk_live_51Hxyzabcdefghij and DATABASE_URL=postgres://admin:hunter2@db.internal/prod.',
       'The key tok-9f8e7d6c5b4a works.',
@@ -417,7 +419,7 @@ describe('handoff', () => {
     await $.tool.call(EDIT('src/app.ts'))
     await $.tool.call({ tool: 'Bash', command: 'git commit -am "Rotate the key"' })
     await $.turn.complete(TURN(notes))
-    expect(Object.values(w.files).join('\n')).not.toContain('tok-9f8e')
+    expect(JSON.stringify([...w.store])).not.toContain('tok-9f8e')
     await $.turn.complete(TURN('partial ```ts\nconst leaked = 1', { reason: 'aborted', isAborted: true }))
     await $.turn.complete(TURN('subagent notes', { agentId: 'a1' }))
     await $.session.end(END())
@@ -509,12 +511,14 @@ describe('handoff', () => {
 
   test('/clear and resume hand off, forget Allow answers, and the next conversation gets a full brief', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
-    const w = world(on, { hark: healthy, answer: () => 'Allow' })
+    let started = STARTED
+    const w = world(on, { hark: healthy, answer: () => 'Allow', started: () => started })
 
     await $.session.start(SESSION)
     await block($)
     await $.session.compact({ trigger: 'auto', messages: MESSAGES })
     await $.tool.call(EDIT('src/db/users.ts'))
+    started = STARTED + 1 // Claude Code restarts the conversation's clock at /clear
     await $.session.end(END('clear'))
     const next = (await block($))[1]?.text ?? ''
     await $.tool.call(EDIT('src/db/users.ts'))
@@ -550,32 +554,52 @@ describe('/hark', () => {
     expect(w.statuses.at(-1)).toBe('Hark V-012 · Open · 3 need you')
   })
 
-  test('open resolves the project page once and opens it', { options: { access_key: 'tok' } }, async ($, on) => {
+  test('open prints the project page as a link, resolved once, and starts no program', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
     const w = world(on, { hark: healthy })
 
     await $.session.start(SESSION)
+    await block($) // the brief fetched at start, which /hark open doesn't wait for
     const { text } = await $.command.run(COMMAND('open'))
     await $.command.run(COMMAND('open'))
 
-    expect(w.runs.at(-1)).toEqual(['open', `https://harkstudio.io/ventures/${UUID}`])
-    expect(text).toBe(`Opened [V-012 on Hark](https://harkstudio.io/ventures/${UUID})`)
+    expect(text).toBe(`V-012 on Hark: https://harkstudio.io/ventures/${UUID}`)
     expect(w.tools().filter(t => t === 'get_venture')).toHaveLength(1)
+    expect(w.runs).toEqual([])
   })
 
-  test('open falls back to xdg-open, and gives the link when neither opens it', { options: { access_key: 'tok' } }, async ($, on) => {
+  test('open falls back to the studio page when the project id is unknown', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on)
-    let xdg = 0
-    const w = world(on, { hark: healthy, run: argv => (argv[0] === 'open' ? { exitCode: 127 } : argv[0] === 'xdg-open' ? { exitCode: xdg } : undefined) })
+    world(on, { hark: (tool, args) => (tool === 'get_venture' ? undefined : healthy(tool, args)) })
 
     await $.session.start(SESSION)
-    const first = await $.command.run(COMMAND('open'))
-    xdg = 3
-    const second = await $.command.run(COMMAND('open'))
+    await block($) // the brief fetched at start, which /hark open doesn't wait for
+    const { text } = await $.command.run(COMMAND('open'))
 
-    const url = `https://harkstudio.io/ventures/${UUID}`
-    expect(w.runs.filter(r => r[0] === 'open' || r[0] === 'xdg-open')).toEqual([['open', url], ['xdg-open', url], ['open', url], ['xdg-open', url]])
-    expect([first.text, second.text]).toEqual([`Opened [V-012 on Hark](${url})`, `Open [V-012 on Hark](${url})`])
+    expect(text).toBe('V-012 on Hark: https://harkstudio.io/studio')
+  })
+
+  test('open links a project named by its uuid without asking Hark for it', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on)
+    const w = world(on, { project: `${UUID}\n`, hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($)
+    const { text } = await $.command.run(COMMAND('open'))
+
+    expect(text).toBe(`${UUID} on Hark: https://harkstudio.io/ventures/${UUID}`)
+    expect(w.tools()).toEqual(['get_agent_brief'])
+  })
+
+  test('open reads the id from a get_venture reply that nests the venture', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on)
+    world(on, { hark: (tool, args) => (tool === 'get_venture' ? { result: { venture: { id: UUID, code: 'V-012' } } } : healthy(tool, args)) })
+
+    await $.session.start(SESSION)
+    await block($)
+    const { text } = await $.command.run(COMMAND('open'))
+
+    expect(text).toBe(`V-012 on Hark: https://harkstudio.io/ventures/${UUID}`)
   })
 
   test('handoff ends the session now, exit adds nothing; unknown words print usage', { options: { access_key: 'tok' } }, async ($, on) => {
@@ -598,54 +622,44 @@ describe('/hark', () => {
 
 describe('one conversation across processes', () => {
   const NOW = STARTED + 60 * 60_000
-  // What the first process left behind: a fresh brief, an open Hark session, one edit, notes and an Allow.
   const ID = '0123456789abcdef0123456789abcdef'
-  const saved = (over: Record<string, unknown> = {}) => JSON.stringify({
-    id: ID, latest: 'first-process', segment: 0, closed: false, opened: true, updatedAt: NOW - 60_000, brief: BRIEF, briefAt: NOW - 5 * 60_000, recap: false,
+  const t36 = (ms: number) => ms.toString(36)
+  // What the first process left in the store: its record (an open Hark session, one edit, notes and an Allow) and the project's brief.
+  const first = (over: Record<string, unknown> = {}) => ({
+    id: ID, latest: 'first-process', segment: 0, closed: false, opened: true, updatedAt: NOW - 60_000, briefAt: NOW - 5 * 60_000, recap: false,
     handoff: 'Open', needs: 2, notes: 'Wired the deposit rate.', files: ['src/a.ts'], commits: [], tests: [], links: [],
     allowed: ['d2'], sessions: ['first-process'], ...over,
   })
-  const project = { '/work/.hark/project': 'V-012\n' }
+  const firstKey = async () => `c:${await keyOf()}:${t36(NOW - 120_000)}:first`
+  const seeded = async (over: Record<string, unknown> = {}, brief: unknown = { at: NOW - 5 * 60_000, brief: BRIEF }) =>
+    ({ [await firstKey()]: first(over), ...(brief ? { 'brief:V-012': brief } : {}) })
+  // This process's own record: the last one stored for the conversation.
+  const mine = async (w: { store: Map<string, unknown> }, key?: string) => {
+    const k = key ?? (await keyOf())
+    return [...w.store].filter(([name]) => name.startsWith(`c:${k}:`)).at(-1)?.[1] as Record<string, unknown> | undefined
+  }
+  const claims = (w: { store: Map<string, unknown> }) => [...w.store.keys()].filter(k => k.startsWith('handoff:'))
 
-  test('saves the conversation to ~/.claude/hark/<key>.json as work happens', { options: { access_key: 'tok' } }, async ($, on) => {
+  test('keeps the conversation in the plugin store as work happens: no file written, no program run', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const w = world(on, { env: { HOME }, hark: healthy })
+    const w = world(on, { hark: healthy })
 
     await $.session.start(SESSION)
     await block($)
     await $.tool.call({ tool: 'Write', file_path: '/work/src/app.ts', content: 'x' })
 
-    const state = JSON.parse(w.files[stateFile(await keyOf())] ?? '{}')
-    expect(state).toMatchObject({ segment: 0, closed: false, opened: true, briefAt: NOW, files: ['src/app.ts'], sessions: ['sess-1'], latest: 'sess-1', handoff: 'Open', needs: 2 })
-    expect(state.brief).toEqual(BRIEF)
-    expect(state.id).toBe(JSON.parse(w.calls[0]?.body ?? '{}').params._meta.conversation)
-    expect(w.runs).toContainEqual(['mkdir', '-p', '-m', '700', `${HOME}/.claude/hark`]) // private to this user
-  })
-
-  test('makes the state folder private with mkdir -m 700, then chmod 700', { options: { access_key: 'tok' } }, async ($, on) => {
-    mock.clock(on, { now: NOW })
-    const w = world(on, { env: { HOME }, hark: healthy })
-
-    await $.session.start(SESSION)
-    await block($)
-
-    expect(w.runs.slice(0, 2)).toEqual([['mkdir', '-p', '-m', '700', `${HOME}/.claude/hark`], ['chmod', '700', `${HOME}/.claude/hark`]])
-  })
-
-  test('uses USERPROFILE when HOME is unset (Windows)', { options: { access_key: 'tok' } }, async ($, on) => {
-    mock.clock(on, { now: NOW })
-    const w = world(on, { env: { USERPROFILE: HOME }, hark: healthy })
-
-    await $.session.start(SESSION)
-    await $.tool.call({ tool: 'Write', file_path: '/work/src/app.ts', content: 'x' })
-
-    expect(JSON.parse(w.files[stateFile(await keyOf())] ?? '{}')).toMatchObject({ files: ['src/app.ts'] })
+    const key = await keyOf()
+    expect([...w.store.keys()]).toEqual([expect.stringMatching(new RegExp(`^c:${key}:${t36(NOW)}:[0-9a-f]{8}$`)), 'brief:V-012'])
+    const state = await mine(w)
+    expect(state).toMatchObject({ segment: 0, closed: false, opened: true, updatedAt: NOW, briefAt: NOW, files: ['src/app.ts'], sessions: ['sess-1'], latest: 'sess-1', handoff: 'Open', needs: 2 })
+    expect(state?.id).toBe(JSON.parse(w.calls[0]?.body ?? '{}').params._meta.conversation)
+    expect(w.store.get('brief:V-012')).toEqual({ at: NOW, brief: BRIEF }) // one cached brief per project
+    expect([w.writes, w.runs]).toEqual([[], []])
   })
 
   test('a second process resumes it: no new brief under 30 minutes, the cached one is injected, earlier work is handed off', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const key = await keyOf()
-    const w = world(on, { env: { HOME }, sessionId: 'background', files: { ...project, [stateFile(key)]: saved() }, hark: healthy, answer: () => 'Stop' })
+    const w = world(on, { sessionId: 'background', store: await seeded(), hark: healthy, answer: () => 'Stop' })
 
     const blocks = await block($) // a background process rebuilds its context before session.start
     await $.session.start(SESSION)
@@ -661,22 +675,25 @@ describe('one conversation across processes', () => {
     expect(end?.args.what_changed).toBe('edited src/a.ts\nedited src/db/users.ts')
     expect(end?.args.what_i_did).toContain('Agent notes:\nWired the deposit rate.')
     expect(JSON.parse(end?.body ?? '{}').params._meta.conversation).toBe(ID) // the same id the first process used
-    expect(JSON.parse(w.files[stateFile(key)] ?? '{}')).toMatchObject({ id: ID, closed: true, opened: false, latest: 'background', sessions: ['first-process', 'background'] })
+    expect(await mine(w)).toMatchObject({ id: ID, closed: true, opened: false, latest: 'background', sessions: ['first-process', 'background'] })
+    expect(w.store.get(await firstKey())).toEqual(first()) // each process writes only its own record
   })
 
-  test('the brief is fetched again once the state is over 30 minutes old, however recent the brief', { options: { access_key: 'tok' } }, async ($, on) => {
-    mock.clock(on, { now: NOW })
-    const w = world(on, { env: { HOME }, files: { ...project, [stateFile(await keyOf())]: saved({ updatedAt: NOW - 31 * 60_000, briefAt: NOW - 31 * 60_000 }) }, hark: healthy })
+  for (const [minutes, tools] of [[29, []], [31, ['get_agent_brief']]] as const) {
+    test(`state saved ${minutes} minutes ago ${minutes < 30 ? 'reuses the cached brief' : 'fetches a new brief, however recent the cache'}`, { options: { access_key: 'tok' } }, async ($, on) => {
+      mock.clock(on, { now: NOW })
+      const w = world(on, { store: await seeded({ updatedAt: NOW - minutes * 60_000, briefAt: NOW - minutes * 60_000 }, { at: NOW - minutes * 60_000, brief: BRIEF }), hark: healthy })
 
-    await $.session.start(SESSION)
-    await block($)
+      await $.session.start(SESSION)
+      await block($)
 
-    expect(w.tools()).toEqual(['get_agent_brief'])
-  })
+      expect(w.tools()).toEqual([...tools])
+    })
+  }
 
   test('a busy conversation reuses its brief, however old the brief, while the state is fresh', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const w = world(on, { env: { HOME }, files: { ...project, [stateFile(await keyOf())]: saved({ briefAt: NOW - 3 * 60 * 60_000 }) }, hark: healthy })
+    const w = world(on, { store: await seeded({ briefAt: NOW - 3 * 60 * 60_000 }, { at: NOW - 3 * 60 * 60_000, brief: BRIEF }), hark: healthy })
 
     await $.session.start(SESSION)
     await block($)
@@ -684,9 +701,54 @@ describe('one conversation across processes', () => {
     expect(w.calls).toEqual([])
   })
 
+  test('without a cached brief for the project, a fresh state still fetches one', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const w = world(on, { store: await seeded({}, null), hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($)
+
+    expect(w.tools()).toEqual(['get_agent_brief'])
+  })
+
+  test("a cached brief isn't reused when this conversation never fetched one, or fetched a newer one", { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const DAY = 24 * 60 * 60_000
+    const never = world(on, { store: await seeded({ opened: false, briefAt: 0 }, { at: NOW - 13 * DAY, brief: BRIEF }), hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($)
+
+    expect(never.tools()).toEqual(['get_agent_brief'])
+  })
+
+  test('a cached brief older than the conversation\'s own last fetch is not reused', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const w = world(on, { store: await seeded({ briefAt: NOW - 5 * 60_000 }, { at: NOW - 10 * 60_000, brief: BRIEF }), hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($)
+
+    expect(w.tools()).toEqual(['get_agent_brief'])
+  })
+
+  test('a later process of the conversation reuses the brief this one fetched, from the record this one left', { options: { access_key: 'tok' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = world(on, { hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($)
+    await clock.advance(10 * 60_000)
+    await $.session.end(END('resume')) // the same conversation key: the next boot has only the store to go on
+    const next = await block($)
+
+    expect(next[1]?.text).toContain(JSON.stringify(BRIEF))
+    expect(w.tools()).toEqual(['get_agent_brief', 'close_session'])
+  })
+
   test('once another process handed off, this one sends nothing for the same work', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const w = world(on, { env: { HOME }, files: { ...project, [stateFile(await keyOf())]: saved({ closed: true, opened: false, handoff: 'Clean' }) }, hark: healthy })
+    const w = world(on, { store: await seeded({ closed: true, opened: false, handoff: 'Clean' }), hark: healthy })
 
     await $.session.start(SESSION)
     const reply = await $.command.run(COMMAND('handoff'))
@@ -696,47 +758,56 @@ describe('one conversation across processes', () => {
     expect(w.calls).toEqual([])
   })
 
-  test('only the process that wins the lock hands a segment off', { options: { access_key: 'tok' } }, async ($, on) => {
+  test('only the process whose claim the store holds first hands a segment off', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     const key = await keyOf()
-    const w = world(on, { env: { HOME }, files: { ...project, [stateFile(key)]: saved() }, hark: healthy })
-    const lock = stateFile(key).replace(/\.json$/, '.0.lock')
-    w.dirs.add(lock) // another process is handing it off right now
-    w.lockTimes.set(lock, NOW - 5_000)
+    const w = world(on, {
+      store: await seeded(),
+      hark: healthy,
+      // another process ending the same conversation stores its claim a moment before this one's lands
+      onSet: (k, store) => { if (k.startsWith('handoff:')) store.set(`handoff:${key}:0:${t36(NOW)}:other`, true) },
+    })
 
     await $.session.start(SESSION)
     const reply = await $.command.run(COMMAND('handoff'))
 
     expect(reply.text).toBe('Another Claude Code process is handing this conversation off.')
     expect(w.calls).toEqual([])
+    expect(claims(w)).toEqual([`handoff:${key}:0:${t36(NOW)}:other`, expect.stringMatching(new RegExp(`^handoff:${key}:0:${t36(NOW)}:[0-9a-f-]{36}$`))])
   })
 
-  test('a lock left behind by a process that died mid-handoff expires', { options: { access_key: 'tok' } }, async ($, on) => {
+  for (const [age, reply] of [[29_000, 'Another Claude Code process is handing this conversation off.'], [31_000, 'Handoff saved to Hark (V-012).']] as const) {
+    test(`a claim ${age / 1000} s old ${age < 30_000 ? 'still holds' : 'was left by a process that died mid-handoff, and expires'}`, { options: { access_key: 'tok' } }, async ($, on) => {
+      mock.clock(on, { now: NOW })
+      world(on, { store: { ...(await seeded()), [`handoff:${await keyOf()}:0:${t36(NOW - age)}:dead`]: true }, hark: healthy })
+
+      await $.session.start(SESSION)
+
+      expect((await $.command.run(COMMAND('handoff'))).text).toBe(reply)
+    })
+  }
+
+  test('when the store refuses the claim, the closed flag decides; a live earlier claim still wins', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     const key = await keyOf()
-    const w = world(on, { env: { HOME }, files: { ...project, [stateFile(key)]: saved() }, hark: healthy })
-    const lock = stateFile(key).replace(/\.json$/, '.0.lock')
-    w.dirs.add(lock)
-    w.lockTimes.set(lock, NOW - 60_000)
+    const w = world(on, { store: await seeded(), hark: healthy, storeFails: (op, k) => op === 'set' && (k ?? '').startsWith('handoff:') })
 
     await $.session.start(SESSION)
-    const reply = await $.command.run(COMMAND('handoff'))
-
-    expect(reply.text).toBe('Handoff saved to Hark (V-012).')
+    w.store.set(`handoff:${key}:0:${t36(NOW - 1000)}:other`, true)
+    expect((await $.command.run(COMMAND('handoff'))).text).toBe('Another Claude Code process is handing this conversation off.')
+    w.store.delete(`handoff:${key}:0:${t36(NOW - 1000)}:other`)
+    expect((await $.command.run(COMMAND('handoff'))).text).toBe('Handoff saved to Hark (V-012).')
   })
 
   test('work recorded while end_session is in flight is not lost: it opens the next segment', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const key = await keyOf()
-    const w = world(on, { env: { HOME },
-      files: { ...project, [stateFile(key)]: saved() },
+    const store = await seeded()
+    const w = world(on, {
+      store,
       hark: (tool, args) => {
+        // the background process edits src/late.ts while this end_session is on the wire: it sees segment 0 closed and opens segment 1
         if (tool === 'end_session' && !String(args.what_changed).includes('late.ts')) {
-          // the background process edits src/late.ts while this end_session is on the wire
-          const state = JSON.parse(w.files[stateFile(key)] ?? '{}')
-          w.files[stateFile(key)] = JSON.stringify(state.closed
-            ? { ...state, segment: state.segment + 1, closed: false, files: ['src/late.ts'], updatedAt: NOW + 1 }
-            : { ...state, files: [...state.files, 'src/late.ts'], updatedAt: NOW + 1 })
+          w.store.set(Object.keys(store)[0] ?? '', first({ segment: 1, closed: false, files: ['src/late.ts'], updatedAt: NOW + 1 }))
         }
         return healthy(tool, args)
       },
@@ -749,9 +820,104 @@ describe('one conversation across processes', () => {
     expect(w.calls.filter(c => c.tool === 'end_session').map(c => c.args.what_changed)).toEqual(['edited src/a.ts', 'edited src/late.ts'])
   })
 
-  test('a corrupt state file is ignored, not fatal', { options: { access_key: 'tok' } }, async ($, on) => {
+  test('an edit made after another process handed the segment off opens the next segment and is handed off alone', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const w = world(on, { env: { HOME }, files: { ...project, [stateFile(await keyOf())]: JSON.stringify({ files: null, notes: 7, segment: 'x', allowed: 'd2' }) }, hark: healthy })
+    const w = world(on, { store: await seeded(), hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($) // boot has merged the first process's open segment
+    w.store.set(await firstKey(), first({ closed: true, opened: false, handoff: 'Clean', updatedAt: NOW })) // the first process hands it off meanwhile
+    await $.tool.call({ tool: 'Write', file_path: '/work/b.ts', content: 'x' })
+    await $.session.end(END())
+
+    expect(w.calls.filter(c => c.tool === 'end_session').map(c => c.args.what_changed)).toEqual(['edited b.ts'])
+  })
+
+  test('parallel edits are all recorded, with another record of the conversation to merge', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const w = world(on, { store: await seeded(), hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($)
+    await Promise.all(['f0', 'f1', 'f2', 'f3'].map(f => $.tool.call({ tool: 'Write', file_path: `/work/${f}.ts`, content: 'x' })))
+    await $.session.end(END())
+
+    const changed = String(w.calls.find(c => c.tool === 'end_session')?.args.what_changed).split('\n').sort()
+    expect(changed).toEqual(['edited f0.ts', 'edited f1.ts', 'edited f2.ts', 'edited f3.ts', 'edited src/a.ts'])
+  })
+
+  test("once a save fails, a moved conversation still hands off this process's unsaved work", { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    let held = false
+    const w = world(on, {
+      files: { '/work/.hark/project': 'V-012\n', '/t/moved.jsonl': JSON.stringify({ type: 'continued-in' }) },
+      hark: healthy,
+      storeFails: op => held && op === 'set',
+    })
+
+    await $.session.start(SESSION)
+    await block($)
+    await $.tool.call({ tool: 'Write', file_path: '/work/a.ts', content: 'x' })
+    held = true // from here the store refuses this process's writes
+    await $.tool.call({ tool: 'Write', file_path: '/work/b.ts', content: 'x' })
+    await $.classic.SessionEnd({ reason: 'other', transcript_path: '/t/moved.jsonl' })
+    await $.session.end(END())
+
+    expect(w.calls.find(c => c.tool === 'end_session')?.args.what_changed).toBe('edited a.ts\nedited b.ts')
+  })
+
+  test("at exit, a held store lock doesn't hold up the handoff: each write waits at most 150 ms", { options: { access_key: 'tok' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    let held = false
+    let release = () => {}
+    const gate = new Promise<void>(r => { release = r })
+    const w = world(on, { hark: healthy, hold: () => (held ? gate : undefined) })
+
+    await $.session.start(SESSION)
+    await block($)
+    await $.tool.call({ tool: 'Write', file_path: '/work/a.ts', content: 'x' })
+    held = true // another process holds the store's lock from here
+    const end = $.session.end(END())
+    for (let i = 0; i < 10 && !w.tools().includes('end_session'); i++) {
+      for (let j = 0; j < 20; j++) await Promise.resolve() // let the hook reach its wait
+      await clock.advance(50)
+    }
+
+    expect(w.tools()).toContain('end_session')
+    release()
+    await end
+  })
+
+  test('records that disagree on the conversation id: the first one stored names it, for every process', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const LATER = 'fedcba9876543210fedcba9876543210'
+    const store = { ...(await seeded()), [`c:${await keyOf()}:${t36(NOW - 60_000)}:second`]: first({ id: LATER, latest: 'second-process', sessions: ['second-process'] }) }
+    const w = world(on, { sessionId: 'third', store, hark: healthy })
+
+    await $.session.start(SESSION)
+    await $.tool.call({ tool: 'Write', file_path: '/work/b.ts', content: 'x' })
+    await $.session.end(END())
+
+    expect(JSON.parse(w.calls.find(c => c.tool === 'end_session')?.body ?? '{}').params._meta.conversation).toBe(ID)
+  })
+
+  test('a process keeps the id of its own earlier record when a newer record disagrees', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const w = world(on, { hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($)
+    const own = JSON.parse(w.calls[0]?.body ?? '{}').params._meta.conversation
+    w.store.set(`c:${await keyOf()}:${t36(NOW)}:newer`, { ...(await mine(w)), id: 'fedcba9876543210fedcba9876543210', updatedAt: NOW + 1 })
+    await $.tool.call({ tool: 'Write', file_path: '/work/b.ts', content: 'x' })
+    await $.session.end(END())
+
+    expect(JSON.parse(w.calls.find(c => c.tool === 'end_session')?.body ?? '{}').params._meta.conversation).toBe(own)
+  })
+
+  test('a corrupt record is ignored, not fatal', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const w = world(on, { store: { [await firstKey()]: { files: null, notes: 7, segment: 'x', allowed: 'd2' } }, hark: healthy })
 
     await $.session.start(SESSION)
     await block($)
@@ -762,33 +928,60 @@ describe('one conversation across processes', () => {
     expect(w.logs).toEqual([])
   })
 
+  for (const op of ['get', 'delete'] as const) {
+    test(`a store that refuses ${op} on single keys does not stop hark starting`, { options: { access_key: 'tok' } }, async ($, on) => {
+      mock.clock(on, { now: NOW })
+      const DAY = 24 * 60 * 60_000
+      const stale = { [`c:bb:${t36(NOW - 15 * DAY)}:x`]: first({ updatedAt: NOW - 15 * DAY }), 'brief:V-001': { at: NOW - 15 * DAY, brief: BRIEF } }
+      const w = world(on, { store: { ...(await seeded()), ...stale }, hark: healthy, storeFails: o => o === op })
+
+      await $.session.start(SESSION)
+
+      expect((await block($))[1]?.name).toBe('hark')
+      expect(w.logs).toEqual([])
+    })
+  }
+
+  test('a store that refuses every call: nothing is shared, the handoff still goes out, one log line', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const w = world(on, { files: { '/work/.hark/project': 'V-012\n', '/t/moved.jsonl': JSON.stringify({ type: 'continued-in' }) }, hark: healthy, storeFails: () => true })
+
+    await $.session.start(SESSION)
+    await block($)
+    await $.tool.call({ tool: 'Write', file_path: '/work/a.ts', content: 'x' })
+    await $.classic.SessionEnd({ reason: 'other', transcript_path: '/t/moved.jsonl' }) // even after a move: no one else has this work
+    await $.session.end(END())
+
+    expect(w.tools()).toEqual(['get_agent_brief', 'list_journal_entries', 'end_session'])
+    expect(w.logs).toHaveLength(1)
+    expect(w.logs[0]).toStartWith('hark: state not saved (')
+  })
+
   test("the agent's own end_session closes the shared state, in every process", { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const key = await keyOf()
-    const w = world(on, { env: { HOME }, files: { ...project, [stateFile(key)]: saved() }, hark: healthy })
+    const w = world(on, { store: await seeded(), hark: healthy })
 
     await $.session.start(SESSION)
     await $.tool.call({ tool: 'mcp__hark__end_session', venture: 'V-012', what_i_did: 'x', what_changed: 'y', whats_next: 'z' } as never)
 
-    expect(JSON.parse(w.files[stateFile(key)] ?? '{}')).toMatchObject({ closed: true, handoff: 'Clean' })
+    expect(await mine(w)).toMatchObject({ closed: true, handoff: 'Clean' })
   })
 
-  test('the state lives in ~/.claude/hark whatever CLAUDE_CONFIG_DIR says, and an Allow is saved before the edit runs', { options: { access_key: 'tok' } }, async ($, on) => {
+  test('an Allow is saved before the edit runs', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     on('tool.call', { tool: 'Edit' }, () => ({ isError: true, result: 'String not found', text: 'String not found' }) as never)
-    const w = world(on, { env: { HOME, CLAUDE_CONFIG_DIR: '/cfg' }, hark: healthy, answer: () => 'Allow' })
+    const w = world(on, { hark: healthy, answer: () => 'Allow' })
 
     await $.session.start(SESSION)
     await $.tool.call(EDIT('src/db/users.ts'))
 
-    expect(JSON.parse(w.files[stateFile(await keyOf())] ?? '{}')).toMatchObject({ allowed: ['d2'], files: [] })
-    expect(Object.keys(w.files).some(f => f.startsWith('/cfg'))).toBe(false)
+    expect(await mine(w)).toMatchObject({ allowed: ['d2'], files: [] })
   })
 
   test('repeated test runs are each counted, in order', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     let run = 0
-    const w = world(on, { env: { HOME }, hark: healthy, bash: () => ({ result: { stdout: '', stderr: '', interrupted: false }, isError: [true, false, true][run++] }) })
+    const w = world(on, { hark: healthy, bash: () => ({ result: { stdout: '', stderr: '', interrupted: false }, isError: [true, false, true][run++] }) })
 
     await $.session.start(SESSION)
     for (let i = 0; i < 3; i++) await $.tool.call({ tool: 'Bash', command: 'npm test' })
@@ -802,8 +995,8 @@ describe('one conversation across processes', () => {
     mock.clock(on, { now: NOW })
     const rows = (...types: string[]) => types.map(type => JSON.stringify({ type })).join('\n')
     const moved = '/t/moved.jsonl', back = '/t/back.jsonl'
-    const w = world(on, { env: { HOME },
-      files: { ...project, [moved]: rows('user', 'assistant', 'continued-in', 'user'), [back]: rows('user', 'continued-in', 'assistant') },
+    const w = world(on, {
+      files: { '/work/.hark/project': 'V-012\n', [moved]: rows('user', 'assistant', 'continued-in', 'user'), [back]: rows('user', 'continued-in', 'assistant') },
       hark: healthy,
     })
 
@@ -813,63 +1006,88 @@ describe('one conversation across processes', () => {
     await $.classic.SessionEnd({ reason: 'other', transcript_path: moved })
     await $.session.end(END())
     expect(w.tools()).toEqual(['get_agent_brief', 'list_journal_entries'])
-    expect(JSON.parse(w.files[stateFile(await keyOf())] ?? '{}')).toMatchObject({ closed: false, files: ['src/app.ts'] })
+    expect(w.reads).toContain(moved) // read through the host: no program runs
+    expect(await mine(w)).toMatchObject({ closed: false, files: ['src/app.ts'] })
 
     await $.classic.SessionEnd({ reason: 'other', transcript_path: back }) // the person came back to it here
     await $.session.end(END())
     expect(w.tools()).toEqual(['get_agent_brief', 'list_journal_entries', 'end_session'])
+    expect(w.runs).toEqual([])
   })
 
-  test('without a tail command, the transcript is read whole to see the move', { options: { access_key: 'tok' } }, async ($, on) => {
+  for (const transcript of ['/t/too-big.jsonl', '']) {
+    test(`with ${transcript ? 'an unreadable transcript' : 'no transcript'}, a later process joining the conversation counts as a move`, { options: { access_key: 'tok' } }, async ($, on) => {
+      mock.clock(on, { now: NOW })
+      const key = await keyOf()
+      const w = world(on, { hark: healthy })
+
+      await $.session.start(SESSION)
+      await block($)
+      await $.tool.call({ tool: 'Write', file_path: '/work/a.ts', content: 'x' })
+      w.store.set(`c:${key}:${t36(NOW)}:background`, { ...(await mine(w)), latest: 'background', updatedAt: NOW + 1 })
+      await $.classic.SessionEnd({ reason: 'other', transcript_path: transcript })
+      await $.session.end(END())
+
+      expect(w.tools()).toEqual(['get_agent_brief', 'list_journal_entries'])
+    })
+  }
+
+  test('with an unreadable transcript, a later record with no session id is not a move', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const moved = '/t/moved.jsonl'
-    const w = world(on, { env: { HOME }, files: { ...project, [moved]: ['user', 'assistant', 'continued-in'].map(type => JSON.stringify({ type })).join('\n') },
-      hark: healthy, run: argv => (argv[0] === 'tail' ? { exitCode: 127 } : undefined) })
-
-    await $.session.start(SESSION)
-    await $.tool.call({ tool: 'Write', file_path: '/work/src/app.ts', content: 'x' })
-    await $.classic.SessionEnd({ reason: 'other', transcript_path: moved })
-    await $.session.end(END())
-
-    expect(w.reads).toContain(moved)
-    expect(w.tools()).not.toContain('end_session')
-  })
-
-  test('with an unreadable transcript, a later process joining the conversation counts as a move', { options: { access_key: 'tok' } }, async ($, on) => {
-    mock.clock(on, { now: NOW })
-    const key = await keyOf()
-    const w = world(on, { env: { HOME }, hark: healthy })
+    const w = world(on, { hark: healthy })
 
     await $.session.start(SESSION)
     await block($)
     await $.tool.call({ tool: 'Write', file_path: '/work/a.ts', content: 'x' })
-    w.files[stateFile(key)] = JSON.stringify({ ...JSON.parse(w.files[stateFile(key)] ?? '{}'), latest: 'background', updatedAt: NOW + 1 })
+    w.store.set(`c:${await keyOf()}:${t36(NOW)}:anon`, { ...(await mine(w)), latest: '', updatedAt: NOW + 1 })
     await $.classic.SessionEnd({ reason: 'other', transcript_path: '/t/too-big.jsonl' })
-    await $.session.end(END())
-
-    expect(w.tools()).toEqual(['get_agent_brief', 'list_journal_entries'])
-  })
-
-  test('without a shared state file, the original still hands off after a move', { options: { access_key: 'tok' } }, async ($, on) => {
-    mock.clock(on, { now: NOW })
-    const w = world(on, { files: { ...project, '/t/moved.jsonl': ['user', 'assistant', 'continued-in'].map(type => JSON.stringify({ type })).join('\n') }, hark: healthy })
-
-    await $.session.start(SESSION)
-    await $.tool.call({ tool: 'Write', file_path: '/work/a.ts', content: 'x' })
-    await $.classic.SessionEnd({ reason: 'other', transcript_path: '/t/moved.jsonl' })
     await $.session.end(END())
 
     expect(w.tools()).toContain('end_session')
   })
 
+  test('with an unreadable transcript, the process that keeps working carries the conversation after a peek joined and left', { options: { access_key: 'tok' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const w = world(on, { hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($)
+    await $.tool.call({ tool: 'Write', file_path: '/work/a.ts', content: 'x' })
+    // a --resume of this conversation joined, handed a.ts off and quit
+    w.store.set(`c:${await keyOf()}:${t36(NOW)}:peek`, { ...(await mine(w)), latest: 'peek', closed: true, opened: false, updatedAt: NOW + 1 })
+    await clock.advance(60_000)
+    await $.tool.call({ tool: 'Write', file_path: '/work/later.ts', content: 'x' })
+    await $.classic.SessionEnd({ reason: 'other', transcript_path: '/t/too-big.jsonl' })
+    await $.session.end(END())
+
+    expect(w.calls.filter(c => c.tool === 'end_session').map(c => c.args.what_changed)).toEqual(['edited later.ts'])
+  })
+
+  test('with an unreadable transcript, the process that got the latest prompt carries the conversation', { options: { access_key: 'tok' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    const key = await keyOf()
+    const w = world(on, { hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($)
+    await $.tool.call({ tool: 'Write', file_path: '/work/a.ts', content: 'x' })
+    w.store.set(`c:${key}:${t36(NOW)}:background`, { ...(await mine(w)), latest: 'background', updatedAt: NOW + 1 })
+    await clock.advance(60_000)
+    await $.prompt.submit({ text: 'One more thing', wait: false, origin: { kind: 'composer' } }) // the person came back to this process
+    await $.classic.SessionEnd({ reason: 'other', transcript_path: '/t/too-big.jsonl' })
+    await $.session.end(END())
+
+    expect(w.tools()).toEqual(['get_agent_brief', 'list_journal_entries', 'end_session'])
+  })
+
   test("the agent view's empty placeholder calls Hark only once it gets a prompt", { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const w = world(on, { env: { HOME, CLAUDE_BG_SOURCE: 'spare' }, hark: healthy })
+    const w = world(on, { env: { CLAUDE_BG_SOURCE: 'spare' }, hark: healthy })
 
     expect(await block($)).toHaveLength(1) // claimed: its context is computed with no prompt
     await $.session.start(SESSION)
     expect(w.calls).toEqual([])
-    expect(w.writes).toEqual([])
+    expect([...w.store.keys()]).toEqual([])
     await $.prompt.submit({ text: 'Fix the deposit maths', wait: false, origin: { kind: 'composer' } })
     expect(w.invalidated).toEqual(['prompt.context'])
     expect((await block($))[1]?.name).toBe('hark')
@@ -880,7 +1098,7 @@ describe('one conversation across processes', () => {
 
   test('a placeholder that already got a prompt is a live conversation: after a reload it starts at once', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
-    const w = world(on, { env: { HOME, CLAUDE_BG_SOURCE: 'spare' }, turns: 1, hark: healthy })
+    const w = world(on, { env: { CLAUDE_BG_SOURCE: 'spare' }, turns: 1, hark: healthy })
 
     await $.session.start(SESSION)
     await $.tool.call({ tool: 'Write', file_path: '/work/src/app.ts', content: 'x' })
@@ -889,10 +1107,10 @@ describe('one conversation across processes', () => {
     expect(w.tools()).toEqual(['get_agent_brief', 'list_journal_entries', 'end_session'])
   })
 
-  test('new work after a handoff starts a new segment, handed off on its own', { options: { access_key: 'tok' } }, async ($, on) => {
+  test('new work after a handoff starts a new segment, handed off on its own, each under its own claim', { options: { access_key: 'tok' } }, async ($, on) => {
     mock.clock(on, { now: NOW })
     const key = await keyOf()
-    const w = world(on, { env: { HOME }, hark: healthy })
+    const w = world(on, { hark: healthy })
 
     await $.session.start(SESSION)
     await block($)
@@ -903,13 +1121,82 @@ describe('one conversation across processes', () => {
 
     const ends = w.calls.filter(c => c.tool === 'end_session').map(c => c.args.what_changed)
     expect(ends).toEqual(['edited a.ts', 'edited b.ts'])
-    expect(w.runs.filter(r => r[0] === 'mkdir' && !r.includes('-p')).map(r => r[1])).toEqual([0, 1].map(n => stateFile(key).replace(/\.json$/, `.${n}.lock`)))
+    expect(claims(w).map(k => k.split(':').slice(0, 3).join(':'))).toEqual([`handoff:${key}:0`, `handoff:${key}:1`])
+  })
+
+  test('prunes records not saved for 14 days, briefs older than 14 days and claims older than an hour, keeping the rest', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const DAY = 24 * 60 * 60_000
+    const keep = { [`c:aa:${t36(NOW - 13 * DAY)}:x`]: first(), [`c:cc:${t36(NOW - 20 * DAY)}:x`]: first({ updatedAt: NOW - 60_000 }), 'brief:V-002': { at: NOW - DAY, brief: BRIEF }, [`handoff:aa:0:${t36(NOW - 50 * 60_000)}:u`]: true }
+    const drop = { [`c:bb:${t36(NOW - 15 * DAY)}:x`]: first({ updatedAt: NOW - 15 * DAY }), 'brief:V-001': { at: NOW - 15 * DAY, brief: BRIEF }, [`handoff:bb:0:${t36(NOW - 61 * 60_000)}:u`]: true }
+    const w = world(on, { store: { ...drop, ...keep, other: 1 }, hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($)
+
+    for (const k of Object.keys(keep)) expect(w.store.has(k), k).toBe(true)
+    for (const k of Object.keys(drop)) expect(w.store.has(k), k).toBe(false)
+    expect(w.store.get('other')).toBe(1) // keys hark doesn't know are left alone
+  })
+
+  test('a record of this conversation older than 14 days is merged before it is dropped', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const DAY = 24 * 60 * 60_000
+    const old = `c:${await keyOf()}:${t36(NOW - 15 * DAY)}:old`
+    const w = world(on, { store: { [old]: first({ updatedAt: NOW - 15 * DAY, briefAt: NOW - 15 * DAY }) }, hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($)
+    await $.tool.call({ tool: 'Write', file_path: '/work/b.ts', content: 'x' })
+    await $.session.end(END())
+
+    expect(w.store.has(old)).toBe(false)
+    const end = w.calls.find(c => c.tool === 'end_session')
+    expect(end?.args.what_changed).toBe('edited src/a.ts\nedited b.ts')
+    expect(JSON.parse(end?.body ?? '{}').params._meta.conversation).toBe(ID)
+  })
+
+  test("once this process stored its record, the conversation's records idle for 30 minutes are dropped; their work stays", { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const key = await keyOf()
+    const idle = `c:${key}:${t36(NOW - 2 * 60 * 60_000)}:idle`, active = `c:${key}:${t36(NOW - 2 * 60 * 60_000)}:active`
+    const w = world(on, { store: { [idle]: first({ updatedAt: NOW - 31 * 60_000 }), [active]: first({ updatedAt: NOW - 60_000, files: ['src/b.ts'] }) }, hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($)
+
+    expect([w.store.has(idle), w.store.has(active)]).toEqual([false, true])
+    const state = await mine(w)
+    expect([...(state?.files as string[])].sort()).toEqual(['src/a.ts', 'src/b.ts'])
+    expect(state?.allowed).toEqual(['d2'])
+  })
+
+  test("when this process's record couldn't be stored, the conversation's other records are kept", { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const idle = `c:${await keyOf()}:${t36(NOW - 2 * 60 * 60_000)}:idle`
+    const w = world(on, { store: { [idle]: first({ updatedAt: NOW - 31 * 60_000 }) }, hark: healthy, storeFails: (op, k) => op === 'set' && (k ?? '').startsWith('c:') })
+
+    await $.session.start(SESSION)
+    await block($)
+
+    expect(w.store.has(idle)).toBe(true)
+  })
+
+  test('removes at most 20 expired entries per start', { options: { access_key: 'tok' } }, async ($, on) => {
+    mock.clock(on, { now: NOW })
+    const expired = Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`brief:V-${100 + i}`, { at: NOW - 15 * 24 * 60 * 60_000, brief: BRIEF }]))
+    const w = world(on, { store: expired, hark: healthy })
+
+    await $.session.start(SESSION)
+    await block($)
+
+    expect([...w.store.keys()].filter(k => k.startsWith('brief:V-1'))).toHaveLength(5)
   })
 
   test('/clear starts a new conversation with its own key and state', { options: { access_key: 'tok' } }, async ($, on) => {
     const clock = mock.clock(on, { now: NOW })
     let started = STARTED
-    const w = world(on, { env: { HOME }, started: () => started, hark: healthy })
+    const w = world(on, { started: () => started, hark: healthy })
 
     await $.session.start(SESSION)
     await block($)
@@ -919,10 +1206,9 @@ describe('one conversation across processes', () => {
     await $.session.end(END('clear'))
     await block($)
 
-    const [first, second] = w.calls.filter(c => c.tool === 'get_agent_brief').map(c => JSON.parse(c.body).params._meta.conversation)
-    const before = JSON.parse(w.files[stateFile(await keyOf())] ?? '{}'), after = JSON.parse(w.files[stateFile(await keyOf('/work', NOW + 1000))] ?? '{}')
-    expect(before).toMatchObject({ id: first, closed: true })
-    expect(after).toMatchObject({ id: second, closed: false, files: [] })
-    expect(first).not.toBe(second)
+    const [one, two] = w.calls.filter(c => c.tool === 'get_agent_brief').map(c => JSON.parse(c.body).params._meta.conversation)
+    expect(await mine(w)).toMatchObject({ id: one, closed: true })
+    expect(await mine(w, await keyOf('/work', NOW + 1000))).toMatchObject({ id: two, closed: false, files: [] })
+    expect(one).not.toBe(two)
   })
 })
